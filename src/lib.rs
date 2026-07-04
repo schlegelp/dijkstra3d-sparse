@@ -21,8 +21,15 @@ fn err(msg: String) -> PyErr {
     PyValueError::new_err(msg)
 }
 
-/// `(dist, pred)` output arrays of `dijkstra_field`.
-type FieldArrays<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<i64>>);
+/// `(dist, pred, hits)` output arrays of `dijkstra_field`.
+type FieldArrays<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i64>>,
+);
+
+/// `(dist, pred, hits)` as plain vectors, produced inside `allow_threads`.
+type FieldVecs = (Vec<f64>, Vec<i64>, Vec<i64>);
 
 /// Extract `(coords_slice, n)` from an `(N, 3)` C-contiguous array.
 fn coords_slice<'a>(voxels: &'a PyReadonlyArray2<'a, i32>) -> PyResult<(&'a [i32], usize)> {
@@ -60,12 +67,14 @@ fn check_len(name: &str, len: usize, n: usize) -> PyResult<()> {
 
 /// Multi-source Dijkstra over the implicit sparse grid.
 ///
-/// Returns flat `(dist, pred)` vectors: length `N` when `min_only`, else
-/// `S * N` (row-major, one Dijkstra run per source; the Python wrapper
-/// reshapes to `(S, N)`).
+/// Returns flat `(dist, pred, hits)` vectors: `dist`/`pred` of length `N`
+/// when `min_only`, else `S * N` (row-major, one Dijkstra run per source;
+/// the Python wrapper reshapes to `(S, N)`). `hits` holds the first-settled
+/// `stop_mask` row per run (`-1` if none): length 1 when `min_only`, else
+/// `S`.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature = (voxels, sources, node_cost, connectivity, anisotropy, cost_mode, free_mask, free_eps, min_only, index_kind))]
+#[pyo3(signature = (voxels, sources, node_cost, connectivity, anisotropy, cost_mode, free_mask, free_eps, min_only, stop_mask, stop_count, index_kind))]
 fn dijkstra_field<'py>(
     py: Python<'py>,
     voxels: PyReadonlyArray2<'py, i32>,
@@ -77,6 +86,8 @@ fn dijkstra_field<'py>(
     free_mask: Option<PyReadonlyArray1<'py, bool>>,
     free_eps: f64,
     min_only: bool,
+    stop_mask: Option<PyReadonlyArray1<'py, bool>>,
+    stop_count: usize,
     index_kind: &str,
 ) -> PyResult<FieldArrays<'py>> {
     let (coords, n) = coords_slice(&voxels)?;
@@ -105,6 +116,16 @@ fn dijkstra_field<'py>(
         }
         None => None,
     };
+    let stop_mask_slice = match &stop_mask {
+        Some(arr) => {
+            let s = arr
+                .as_slice()
+                .map_err(|_| err("stop_mask must be C-contiguous".into()))?;
+            check_len("stop_mask", s.len(), n)?;
+            Some(s)
+        }
+        None => None,
+    };
 
     let mode = CostMode::parse(cost_mode).map_err(err)?;
     if mode != CostMode::Geometric && node_cost_slice.is_none() {
@@ -128,8 +149,8 @@ fn dijkstra_field<'py>(
         )));
     }
 
-    let (dist, pred) = py
-        .allow_threads(|| -> Result<(Vec<f64>, Vec<i64>), String> {
+    let (dist, pred, hits) = py
+        .allow_threads(|| -> Result<FieldVecs, String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             let offsets = build_offsets(connectivity, aniso);
             let problem = Problem {
@@ -145,27 +166,41 @@ fn dijkstra_field<'py>(
             if min_only {
                 let mut dist = vec![0.0f64; n];
                 let mut pred = vec![0i64; n];
-                dijkstra::dijkstra(&problem, sources, &mut dist, &mut pred);
-                Ok((dist, pred))
+                let hit = dijkstra::dijkstra(
+                    &problem,
+                    sources,
+                    stop_mask_slice,
+                    stop_count,
+                    &mut dist,
+                    &mut pred,
+                );
+                Ok((dist, pred, vec![hit]))
             } else {
                 // One independent run per source, reusing the spatial index.
                 let s_count = sources.len();
                 let mut dist = vec![0.0f64; n * s_count];
                 let mut pred = vec![0i64; n * s_count];
+                let mut hits = Vec::with_capacity(s_count);
                 for (i, &s) in sources.iter().enumerate() {
-                    dijkstra::dijkstra(
+                    hits.push(dijkstra::dijkstra(
                         &problem,
                         &[s],
+                        stop_mask_slice,
+                        stop_count,
                         &mut dist[i * n..(i + 1) * n],
                         &mut pred[i * n..(i + 1) * n],
-                    );
+                    ));
                 }
-                Ok((dist, pred))
+                Ok((dist, pred, hits))
             }
         })
         .map_err(err)?;
 
-    Ok((dist.into_pyarray(py), pred.into_pyarray(py)))
+    Ok((
+        dist.into_pyarray(py),
+        pred.into_pyarray(py),
+        hits.into_pyarray(py),
+    ))
 }
 
 /// Connected components over the implicit sparse grid (union-find).

@@ -22,6 +22,8 @@ from . import _native
 
 __all__ = [
     "dijkstra_field",
+    "shortest_path",
+    "shortest_path_to_set",
     "path",
     "connected_components",
     "index_of",
@@ -74,6 +76,80 @@ def _as_node_cost(node_cost: npt.ArrayLike, n: int) -> np.ndarray:
     return arr
 
 
+def _dijkstra_impl(
+    voxels: npt.ArrayLike,
+    sources: npt.ArrayLike,
+    *,
+    node_cost: Optional[npt.ArrayLike],
+    connectivity: int,
+    anisotropy: Tuple[float, float, float],
+    cost_mode: str,
+    free_mask: Optional[npt.ArrayLike],
+    free_eps: float,
+    min_only: bool,
+    stop_mask: Optional[npt.ArrayLike],
+    stop_count: int,
+    index_kind: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validated core call. Returns ``(dist, pred, hits)`` where ``hits``
+    holds the first-settled ``stop_mask`` row per Dijkstra run (``-1`` if
+    none): shape ``(1,)`` for ``min_only=True``, else ``(S,)``."""
+    vox = _as_voxels(voxels)
+    n = vox.shape[0]
+    src = _as_sources(sources, n)
+
+    if connectivity not in _CONNECTIVITIES:
+        raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
+    if cost_mode not in _COST_MODES:
+        raise ValueError(f"cost_mode must be one of {_COST_MODES}, got {cost_mode!r}")
+    if index_kind not in _INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
+
+    anisotropy = tuple(float(w) for w in anisotropy)
+    if len(anisotropy) != 3 or not all(np.isfinite(w) and w > 0 for w in anisotropy):
+        raise ValueError(f"anisotropy must be three finite positive floats, got {anisotropy}")
+    free_eps = float(free_eps)
+    if not (np.isfinite(free_eps) and free_eps > 0):
+        raise ValueError(f"free_eps must be finite and > 0, got {free_eps}")
+    stop_count = int(stop_count)
+    if stop_count < 0:
+        raise ValueError(f"stop_count must be >= 0, got {stop_count}")
+
+    if node_cost is not None:
+        node_cost = _as_node_cost(node_cost, n)
+    else:
+        # Without per-voxel weights every mode degenerates to the pure
+        # geometric step length (vertex: all-ones, additive: all-zeros).
+        cost_mode = "geometric"
+
+    if free_mask is not None:
+        free_mask = np.ascontiguousarray(free_mask, dtype=bool)
+        if free_mask.shape != (n,):
+            raise ValueError(f"free_mask must have shape (N,) = ({n},), got {free_mask.shape}")
+    if stop_mask is not None:
+        stop_mask = np.ascontiguousarray(stop_mask, dtype=bool)
+        if stop_mask.shape != (n,):
+            raise ValueError(f"stop_mask must have shape (N,) = ({n},), got {stop_mask.shape}")
+
+    dist, pred, hits = _native.dijkstra_field(
+        vox,
+        src,
+        node_cost if cost_mode != "geometric" else None,
+        connectivity,
+        anisotropy,
+        cost_mode,
+        free_mask,
+        free_eps,
+        bool(min_only),
+        stop_mask,
+        stop_count,
+        index_kind,
+    )
+    if not min_only:
+        return dist.reshape(len(src), n), pred.reshape(len(src), n), hits
+    return dist, pred, hits
+
+
 def dijkstra_field(
     voxels: npt.ArrayLike,
     sources: npt.ArrayLike,
@@ -85,6 +161,8 @@ def dijkstra_field(
     free_mask: Optional[npt.ArrayLike] = None,
     free_eps: float = 1e-6,
     min_only: bool = True,
+    stop_mask: Optional[npt.ArrayLike] = None,
+    stop_count: int = 1,
     index_kind: str = "hash",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Multi-source Dijkstra distance + predecessor field over sparse voxels.
@@ -126,6 +204,18 @@ def dijkstra_field(
         distance to the *nearest* source; if False run one Dijkstra per
         source and return ``(S, N)`` arrays (rows ordered like ``sources``),
         mirroring :func:`scipy.sparse.csgraph.dijkstra`.
+    stop_mask
+        Optional ``(N,)`` bool mask of stop nodes ("anchors"/"targets"). The
+        search terminates early once ``stop_count`` masked voxels have been
+        *settled*, returning the partial field: everything the search
+        touched is exact (identical to the full field), everything beyond
+        keeps ``dist = +inf``, ``pred = -1``. This is something SciPy's
+        ``limit`` cutoff cannot express — see :func:`shortest_path_to_set`
+        and :func:`shortest_path` for the ergonomic entry points. With
+        ``min_only=False``, each per-source run stops independently.
+    stop_count
+        Stop after this many ``stop_mask`` voxels settle (default 1 — stop
+        at the nearest). ``0`` disables early termination (full field).
     index_kind
         Spatial-index backend, ``"hash"`` (hash map, default — fastest in
         our benchmarks) or ``"sorted"`` (binary search over sorted keys,
@@ -140,51 +230,135 @@ def dijkstra_field(
         the source; ``-1`` for sources and unreached voxels (SciPy's
         convention). Feed to :func:`path` to reconstruct paths.
     """
+    dist, pred, _ = _dijkstra_impl(
+        voxels,
+        sources,
+        node_cost=node_cost,
+        connectivity=connectivity,
+        anisotropy=anisotropy,
+        cost_mode=cost_mode,
+        free_mask=free_mask,
+        free_eps=free_eps,
+        min_only=min_only,
+        stop_mask=stop_mask,
+        stop_count=stop_count,
+        index_kind=index_kind,
+    )
+    return dist, pred
+
+
+def shortest_path_to_set(
+    voxels: npt.ArrayLike,
+    source: int,
+    stop_mask: npt.ArrayLike,
+    *,
+    node_cost: Optional[npt.ArrayLike] = None,
+    connectivity: int = 26,
+    anisotropy: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    cost_mode: str = "vertex",
+    free_mask: Optional[npt.ArrayLike] = None,
+    free_eps: float = 1e-6,
+    index_kind: str = "hash",
+) -> Tuple[np.ndarray, int, float]:
+    """Shortest path from ``source`` to the *nearest* voxel in ``stop_mask``.
+
+    The search terminates the instant the first anchor settles, so each call
+    explores only the catchment ball around ``source`` out to the nearest
+    anchor — not the full voxel set. This is the primitive for incremental
+    tree construction (grafting): query against a growing anchor set, add
+    the returned path to the mask, repeat — each graft gets cheaper as the
+    anchors densify.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates.
+    source
+        Row index to start from. If ``stop_mask[source]`` is set, the query
+        trivially returns the single-voxel path (exclude sources from the
+        mask if self-hits are unwanted).
+    stop_mask
+        ``(N,)`` bool anchor set.
+    node_cost, connectivity, anisotropy, cost_mode, free_mask, free_eps, index_kind
+        As in :func:`dijkstra_field`. Note the cost model is directed:
+        with ``cost_mode="vertex"`` the source→anchor path optimises
+        ``node_cost`` of *entered* voxels, which differs from the
+        anchor→source direction. ``geometric``/``additive`` costs are
+        direction-symmetric.
+
+    Returns
+    -------
+    path : ``(M, 3)`` int32
+        Coordinates from ``source`` to the hit anchor (both inclusive);
+        empty ``(0, 3)`` if no anchor is reachable.
+    hit : int
+        Row index of the anchor reached, or ``-1`` if none is reachable.
+    cost : float
+        Path cost ``dist[hit]``; ``+inf`` if none is reachable.
+    """
+    vox = _as_voxels(voxels)
+    stop_mask = np.ascontiguousarray(stop_mask, dtype=bool)
+    dist, pred, hits = _dijkstra_impl(
+        vox,
+        source,
+        node_cost=node_cost,
+        connectivity=connectivity,
+        anisotropy=anisotropy,
+        cost_mode=cost_mode,
+        free_mask=free_mask,
+        free_eps=free_eps,
+        min_only=True,
+        stop_mask=stop_mask,
+        stop_count=1,
+        index_kind=index_kind,
+    )
+    hit = int(hits[0])
+    if hit < 0:
+        return np.empty((0, 3), dtype=np.int32), -1, float("inf")
+    return path(vox, pred, hit), hit, float(dist[hit])
+
+
+def shortest_path(
+    voxels: npt.ArrayLike,
+    source: int,
+    target: int,
+    *,
+    node_cost: Optional[npt.ArrayLike] = None,
+    connectivity: int = 26,
+    anisotropy: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+    cost_mode: str = "vertex",
+    free_mask: Optional[npt.ArrayLike] = None,
+    free_eps: float = 1e-6,
+    index_kind: str = "hash",
+) -> Tuple[np.ndarray, float]:
+    """Single ``source`` → ``target`` shortest path, terminating the search
+    the instant ``target`` settles (no full field is computed).
+
+    Returns ``(path, cost)``: ``(M, 3)`` int32 coordinates from ``source``
+    to ``target`` and the path cost. If ``target`` is unreachable, returns
+    an empty ``(0, 3)`` array and ``+inf`` (no exception). Other parameters
+    as in :func:`dijkstra_field`.
+    """
     vox = _as_voxels(voxels)
     n = vox.shape[0]
-    src = _as_sources(sources, n)
-
-    if connectivity not in _CONNECTIVITIES:
-        raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
-    if cost_mode not in _COST_MODES:
-        raise ValueError(f"cost_mode must be one of {_COST_MODES}, got {cost_mode!r}")
-    if index_kind not in _INDEX_KINDS:
-        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
-
-    anisotropy = tuple(float(w) for w in anisotropy)
-    if len(anisotropy) != 3 or not all(np.isfinite(w) and w > 0 for w in anisotropy):
-        raise ValueError(f"anisotropy must be three finite positive floats, got {anisotropy}")
-    free_eps = float(free_eps)
-    if not (np.isfinite(free_eps) and free_eps > 0):
-        raise ValueError(f"free_eps must be finite and > 0, got {free_eps}")
-
-    if node_cost is not None:
-        node_cost = _as_node_cost(node_cost, n)
-    else:
-        # Without per-voxel weights every mode degenerates to the pure
-        # geometric step length (vertex: all-ones, additive: all-zeros).
-        cost_mode = "geometric"
-
-    if free_mask is not None:
-        free_mask = np.ascontiguousarray(free_mask, dtype=bool)
-        if free_mask.shape != (n,):
-            raise ValueError(f"free_mask must have shape (N,) = ({n},), got {free_mask.shape}")
-
-    dist, pred = _native.dijkstra_field(
+    target = int(target)
+    if not 0 <= target < n:
+        raise ValueError(f"target index {target} out of range for {n} voxels")
+    stop_mask = np.zeros(n, dtype=bool)
+    stop_mask[target] = True
+    coords, hit, cost = shortest_path_to_set(
         vox,
-        src,
-        node_cost if cost_mode != "geometric" else None,
-        connectivity,
-        anisotropy,
-        cost_mode,
-        free_mask,
-        free_eps,
-        bool(min_only),
-        index_kind,
+        source,
+        stop_mask,
+        node_cost=node_cost,
+        connectivity=connectivity,
+        anisotropy=anisotropy,
+        cost_mode=cost_mode,
+        free_mask=free_mask,
+        free_eps=free_eps,
+        index_kind=index_kind,
     )
-    if not min_only:
-        return dist.reshape(len(src), n), pred.reshape(len(src), n)
-    return dist, pred
+    return coords, cost
 
 
 def path(

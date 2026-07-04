@@ -90,7 +90,12 @@ equivalent explicit graph.
 dijkstra_field(voxels, sources, *, node_cost=None, connectivity=26,
                anisotropy=(1.0, 1.0, 1.0), cost_mode="vertex",
                free_mask=None, free_eps=1e-6, min_only=True,
+               stop_mask=None, stop_count=1,
                index_kind="hash") -> (dist, pred)
+
+shortest_path(voxels, source, target, **kw) -> (path, cost)  # early exit
+
+shortest_path_to_set(voxels, source, stop_mask, **kw) -> (path, hit, cost)
 
 path(voxels, pred, target, *, dist=None) -> (M, 3) int32   # source → target
 
@@ -123,6 +128,48 @@ paths should ride an already-selected node set for ~free before diverging.
 `min_only=False` runs one Dijkstra per source and returns `(S, N)` arrays,
 mirroring SciPy; the default `True` returns a single `(N,)` field of
 distances to the *nearest* source.
+
+### Early termination & search-to-a-set
+
+Dijkstra settles nodes in non-decreasing distance order, so the moment a
+node is popped its distance and path are final. `stop_mask` exploits this:
+the search stops as soon as `stop_count` masked voxels have been *settled*
+(default 1 — i.e. at the **nearest** member of the set), returning a partial
+field that is exact on everything it touched and `+inf`/`-1` beyond. SciPy's
+`limit` distance cutoff cannot express "stop when you reach node X / this
+set". Two wrappers make this ergonomic:
+
+```python
+# point → point, terminating the instant the target settles
+coords, cost = ds.shortest_path(voxels, source, target)
+
+# point → nearest member of an anchor set
+coords, hit, cost = ds.shortest_path_to_set(voxels, source, anchor_mask)
+# hit = row index of the anchor reached (-1 + empty path if unreachable)
+```
+
+This is the primitive for **incremental tree construction** (grafting —
+e.g. centerline/skeleton extraction): repeatedly connect a query voxel to a
+growing anchor set, where each query only explores the local catchment
+between the query and the nearest anchor instead of the full voxel set:
+
+```python
+anchors = np.zeros(len(voxels), dtype=bool)
+anchors[seed] = True
+for query in queries:
+    coords, hit, cost = ds.shortest_path_to_set(voxels, query, anchors)
+    anchors[ds.index_of(voxels, coords)] = True   # graft the spur
+```
+
+On the benchmark tube (1.5M voxels), 60 such grafts run in ~1.4 s total,
+with per-query touched voxels falling from ~10% of N (sparse anchors) to
+~0.3% (dense anchors) — versus 100% of N per query for repeated full
+fields. `stop_mask` composes with everything else: with multiple `sources`
+and `min_only=True` it means "grow a field from all sources until it first
+touches the anchor set". It is also the recommended replacement for
+`free_mask`-based grafting tricks — cleaner (no cost distortion) and
+cheaper (early exit); if both are given they stay independent (`free_mask`
+changes edge costs, `stop_mask` only changes termination).
 
 ### Notes
 

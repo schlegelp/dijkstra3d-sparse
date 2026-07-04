@@ -69,14 +69,35 @@ impl Problem<'_> {
 /// slices (length N each). Unreached voxels keep `+inf` / `-1`; sources get
 /// `dist = 0`, `pred = -1`. `pred` holds row indices into `coords`.
 ///
+/// Early termination: if `stop_mask` is given, the loop breaks once
+/// `stop_count` masked nodes have been *settled* (popped). Settling order is
+/// non-decreasing in distance, so a popped node's `dist`/`pred` — and its
+/// whole predecessor chain — are final: the partial field is bit-identical
+/// to the full field on every node settled before the break. `stop_count`
+/// of 0 disables termination (full field).
+///
+/// Returns `hit`: the row of the *first* settled stop node — with
+/// `stop_count = 1` that is exactly the stop node nearest to the sources —
+/// or `-1` if no stop node was settled (unreachable / empty mask / no
+/// `stop_mask`).
+///
 /// Determinism: heap entries are `(distance_bits, row)` so ties break on the
 /// smaller row index; relaxation uses strict `<`, so among equal-cost
 /// predecessors the first one found (fixed offset order) wins. Output is
 /// therefore reproducible across runs and platforms.
-pub fn dijkstra(p: &Problem<'_>, sources: &[i64], dist: &mut [f64], pred: &mut [i64]) {
+pub fn dijkstra(
+    p: &Problem<'_>,
+    sources: &[i64],
+    stop_mask: Option<&[bool]>,
+    stop_count: usize,
+    dist: &mut [f64],
+    pred: &mut [i64],
+) -> i64 {
     dist.fill(f64::INFINITY);
     pred.fill(-1);
     let mut settled = vec![false; p.n];
+    let mut hit: i64 = -1;
+    let mut settled_stops: usize = 0;
 
     // Distances are finite and non-negative, so `f64::to_bits` is a
     // monotone map to u64 — the heap orders raw bits, no float-ord wrapper.
@@ -93,6 +114,17 @@ pub fn dijkstra(p: &Problem<'_>, sources: &[i64], dist: &mut [f64], pred: &mut [
             continue; // lazy deletion: stale heap entry
         }
         settled[row_us] = true;
+        if let Some(mask) = stop_mask {
+            if mask[row_us] {
+                if hit < 0 {
+                    hit = row_us as i64;
+                }
+                settled_stops += 1;
+                if stop_count > 0 && settled_stops >= stop_count {
+                    break; // dist/pred of every settled node are already final
+                }
+            }
+        }
         let d = dist[row_us];
         let b = row_us * 3;
         let (x, y, z) = (p.coords[b], p.coords[b + 1], p.coords[b + 2]);
@@ -126,6 +158,7 @@ pub fn dijkstra(p: &Problem<'_>, sources: &[i64], dist: &mut [f64], pred: &mut [
             }
         }
     }
+    hit
 }
 
 #[cfg(test)]
@@ -155,11 +188,21 @@ mod tests {
         };
         let mut dist = vec![0.0; 5];
         let mut pred = vec![0i64; 5];
-        dijkstra(&p, &[0], &mut dist, &mut pred);
+        let hit = dijkstra(&p, &[0], None, 1, &mut dist, &mut pred);
+        assert_eq!(hit, -1);
         for i in 0..5 {
             assert!((dist[i] - i as f64).abs() < 1e-12);
         }
         assert_eq!(pred, vec![-1, 0, 1, 2, 3]);
+
+        // early stop: settle up to voxel 2, leave the tail untouched
+        let mut stop = vec![false; 5];
+        stop[2] = true;
+        let hit = dijkstra(&p, &[0], Some(&stop), 1, &mut dist, &mut pred);
+        assert_eq!(hit, 2);
+        assert_eq!(dist[2], 2.0); // final — prefix identical to the full field
+        assert!(dist[4].is_infinite()); // never relaxed: loop broke at the hit
+        assert_eq!(pred[4], -1);
     }
 
     #[test]
@@ -180,7 +223,11 @@ mod tests {
         };
         let mut dist = vec![0.0; 3];
         let mut pred = vec![0i64; 3];
-        dijkstra(&p, &[0, 1], &mut dist, &mut pred);
+        // stop node unreachable -> heap drains, hit stays -1
+        let mut stop = vec![false; 3];
+        stop[2] = true;
+        let hit = dijkstra(&p, &[0, 1], Some(&stop), 1, &mut dist, &mut pred);
+        assert_eq!(hit, -1);
         assert_eq!(dist[0], 0.0);
         assert_eq!(dist[1], 0.0);
         assert!(dist[2].is_infinite());

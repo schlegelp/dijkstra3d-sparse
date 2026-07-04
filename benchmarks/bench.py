@@ -131,6 +131,30 @@ def run_workload(task: str, n_target: int, index_kind: str) -> dict:
         dist = scipy_dijkstra(csr, directed=True, indices=0)
         extra["solve_seconds"] = time.perf_counter() - t1
         assert np.isfinite(dist).all(), "tube should be fully connected"
+    elif task == "graft":
+        # incremental grafting: repeatedly connect a random query voxel to a
+        # growing anchor set via early-terminating search-to-a-set. The win
+        # to record: per-query touched-voxel count collapses as anchors
+        # densify, versus N for a full field every time.
+        import dijkstra3d_sparse as ds
+
+        rng = np.random.default_rng(0)
+        anchor = np.zeros(n, dtype=bool)
+        anchor[0] = True
+        n_queries = 60
+        touched = []
+        for q in rng.integers(0, n, n_queries):
+            dist, pred = ds.dijkstra_field(vox, int(q), stop_mask=anchor, stop_count=1)
+            touched.append(int(np.isfinite(dist).sum()))
+            finite_anchors = np.flatnonzero(anchor & np.isfinite(dist))
+            hit = int(finite_anchors[np.argmin(dist[finite_anchors])])
+            rows = [hit]  # graft the new spur onto the anchor set
+            while pred[rows[-1]] >= 0:
+                rows.append(int(pred[rows[-1]]))
+            anchor[rows] = True
+        extra["n_queries"] = n_queries
+        extra["touched_first10_mean"] = float(np.mean(touched[:10]))
+        extra["touched_last10_mean"] = float(np.mean(touched[-10:]))
     else:
         raise ValueError(task)
     elapsed = time.perf_counter() - t0
@@ -181,7 +205,7 @@ def main() -> None:
     n_target = 200_000 if args.quick else 2_000_000
     runs = [("dijkstra", "sorted"), ("dijkstra", "hash"),
             ("components", "sorted"), ("components", "hash"),
-            ("scipy-csr", "-")]
+            ("scipy-csr", "-"), ("graft", "-")]
     results = []
     for task, kind in runs:
         r = run_in_subprocess(task, n_target, kind)
@@ -193,6 +217,7 @@ def main() -> None:
 
     r0 = results[0]
     scipy_r = next(r for r in results if r["task"] == "scipy-csr")
+    graft_r = next(r for r in results if r["task"] == "graft")
     dense_bytes = r0["bbox_cells"] * DENSE_BYTES_PER_CELL
     lines = [
         "# Benchmark results",
@@ -219,6 +244,17 @@ def main() -> None:
         f"{scipy_r['csr_build_seconds']:.2f} s to build the CSR (vectorized NumPy) + "
         f"{scipy_r['solve_seconds']:.2f} s to solve. Materializing the edge list is "
         "exactly the work and memory the implicit-grid walk avoids.",
+        "",
+        f"`graft` is incremental grafting via early-terminating `stop_mask` queries: "
+        f"{graft_r['n_queries']} random query voxels connected one after another to a "
+        f"growing anchor set (each returned path joins the anchors). Mean voxels "
+        f"touched per query: first 10 queries "
+        f"{graft_r['touched_first10_mean']:,.0f} "
+        f"({100 * graft_r['touched_first10_mean'] / graft_r['n']:.1f}% of N) → last 10 "
+        f"queries {graft_r['touched_last10_mean']:,.0f} "
+        f"({100 * graft_r['touched_last10_mean'] / graft_r['n']:.1f}% of N). A full "
+        f"field per query would touch 100% of N every time; the whole "
+        f"{graft_r['n_queries']}-query loop ran in {graft_r['seconds']:.2f} s.",
         "",
         f"Dense baseline for the same bounding box (dist f64 + pred i64 + visited u8 = "
         f"{DENSE_BYTES_PER_CELL} B/cell): **{fmt_bytes(dense_bytes)}** — "

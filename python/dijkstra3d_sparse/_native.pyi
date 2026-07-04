@@ -12,8 +12,10 @@ def dijkstra_field(
     free_mask: Optional[np.ndarray],
     free_eps: float,
     min_only: bool,
+    stop_mask: Optional[np.ndarray],
+    stop_count: int,
     index_kind: str,
-) -> Tuple[np.ndarray, np.ndarray]: ...
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]: ...
 def connected_components(
     voxels: np.ndarray,
     connectivity: int,
