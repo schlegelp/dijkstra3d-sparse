@@ -9,6 +9,10 @@ is ``O(N)`` in the number of voxels, independent of the bounding-box volume.
 Voxels are given as an ``(N, 3)`` integer coordinate array; all per-voxel
 inputs and outputs (``node_cost``, ``free_mask``, ``dist``, ``pred``,
 ``labels``) are 1-D arrays aligned with the rows of ``voxels``.
+
+For repeated queries over the *same* voxel set, build a :class:`Graph`
+once and call its methods — it reuses the spatial index that the free
+functions rebuild on every call.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import numpy.typing as npt
 from . import _native
 
 __all__ = [
+    "Graph",
     "dijkstra_field",
     "shortest_path",
     "shortest_path_to_set",
@@ -76,10 +81,9 @@ def _as_node_cost(node_cost: npt.ArrayLike, n: int) -> np.ndarray:
     return arr
 
 
-def _dijkstra_impl(
-    voxels: npt.ArrayLike,
+def _field_args(
+    n: int,
     sources: npt.ArrayLike,
-    *,
     node_cost: Optional[npt.ArrayLike],
     connectivity: int,
     anisotropy: Tuple[float, float, float],
@@ -89,21 +93,16 @@ def _dijkstra_impl(
     min_only: bool,
     stop_mask: Optional[npt.ArrayLike],
     stop_count: int,
-    index_kind: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Validated core call. Returns ``(dist, pred, hits)`` where ``hits``
-    holds the first-settled ``stop_mask`` row per Dijkstra run (``-1`` if
-    none): shape ``(1,)`` for ``min_only=True``, else ``(S,)``."""
-    vox = _as_voxels(voxels)
-    n = vox.shape[0]
+) -> tuple:
+    """Validate the per-call arguments of a field run — everything except
+    ``voxels``/``index_kind``, which are fixed by the :class:`Graph` handle.
+    Returns the positional argument tuple for the native call."""
     src = _as_sources(sources, n)
 
     if connectivity not in _CONNECTIVITIES:
         raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
     if cost_mode not in _COST_MODES:
         raise ValueError(f"cost_mode must be one of {_COST_MODES}, got {cost_mode!r}")
-    if index_kind not in _INDEX_KINDS:
-        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
 
     anisotropy = tuple(float(w) for w in anisotropy)
     if len(anisotropy) != 3 or not all(np.isfinite(w) and w > 0 for w in anisotropy):
@@ -131,8 +130,7 @@ def _dijkstra_impl(
         if stop_mask.shape != (n,):
             raise ValueError(f"stop_mask must have shape (N,) = ({n},), got {stop_mask.shape}")
 
-    dist, pred, hits = _native.dijkstra_field(
-        vox,
+    return (
         src,
         node_cost if cost_mode != "geometric" else None,
         connectivity,
@@ -143,11 +141,243 @@ def _dijkstra_impl(
         bool(min_only),
         stop_mask,
         stop_count,
-        index_kind,
     )
-    if not min_only:
-        return dist.reshape(len(src), n), pred.reshape(len(src), n), hits
-    return dist, pred, hits
+
+
+class Graph:
+    """Reusable handle: the spatial index over a fixed voxel set, built once.
+
+    Every free function in this module rebuilds the ``coordinate -> row``
+    spatial index — the one ``O(N)`` setup cost — on each call. ``Graph``
+    hoists that build into the constructor, so repeated queries over the
+    *same* voxel set (e.g. several distance fields plus many
+    :meth:`shortest_path_to_set` grafts per skeleton component) pay it once.
+
+    Only ``voxels`` and ``index_kind`` are fixed by the handle. Everything
+    else — ``connectivity``, ``anisotropy``, ``cost_mode``, ``node_cost``,
+    masks — remains a per-method argument, so one handle serves queries
+    with different cost models. Results are identical to the corresponding
+    free functions: only *where* the index is built moves.
+
+    The handle keeps its own copy of the coordinates and is read-only after
+    construction.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates, as in :func:`dijkstra_field`.
+        Duplicate coordinates are rejected here, at construction.
+    index_kind
+        Spatial-index backend, ``"hash"`` (default) or ``"sorted"``, fixed
+        for the lifetime of the handle; see :func:`dijkstra_field`.
+    """
+
+    def __init__(self, voxels: npt.ArrayLike, *, index_kind: str = "hash"):
+        vox = _as_voxels(voxels)
+        if index_kind not in _INDEX_KINDS:
+            raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
+        self._voxels = vox
+        self._graph = _native.Graph(vox, index_kind)
+
+    @property
+    def n(self) -> int:
+        """Number of voxels."""
+        return int(self._voxels.shape[0])
+
+    @property
+    def voxels(self) -> np.ndarray:
+        """The ``(N, 3)`` int32 coordinate array (read-only view)."""
+        view = self._voxels.view()
+        view.flags.writeable = False
+        return view
+
+    @property
+    def index_kind(self) -> str:
+        """Spatial-index backend fixed at construction."""
+        return self._graph.index_kind
+
+    def __repr__(self) -> str:
+        return f"Graph(n={self.n}, index_kind={self.index_kind!r})"
+
+    def _field(
+        self,
+        sources: npt.ArrayLike,
+        *,
+        node_cost: Optional[npt.ArrayLike],
+        connectivity: int,
+        anisotropy: Tuple[float, float, float],
+        cost_mode: str,
+        free_mask: Optional[npt.ArrayLike],
+        free_eps: float,
+        min_only: bool,
+        stop_mask: Optional[npt.ArrayLike],
+        stop_count: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Validated core call, reusing the handle's index. Returns
+        ``(dist, pred, hits)`` where ``hits`` holds the first-settled
+        ``stop_mask`` row per Dijkstra run (``-1`` if none): shape ``(1,)``
+        for ``min_only=True``, else ``(S,)``."""
+        args = _field_args(
+            self.n,
+            sources,
+            node_cost,
+            connectivity,
+            anisotropy,
+            cost_mode,
+            free_mask,
+            free_eps,
+            min_only,
+            stop_mask,
+            stop_count,
+        )
+        dist, pred, hits = self._graph.dijkstra_field(*args)
+        if not min_only:
+            src = args[0]
+            return dist.reshape(len(src), self.n), pred.reshape(len(src), self.n), hits
+        return dist, pred, hits
+
+    def dijkstra_field(
+        self,
+        sources: npt.ArrayLike,
+        *,
+        node_cost: Optional[npt.ArrayLike] = None,
+        connectivity: int = 26,
+        anisotropy: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        cost_mode: str = "vertex",
+        free_mask: Optional[npt.ArrayLike] = None,
+        free_eps: float = 1e-6,
+        min_only: bool = True,
+        stop_mask: Optional[npt.ArrayLike] = None,
+        stop_count: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Multi-source Dijkstra field over the handle's voxels.
+
+        Identical to the free :func:`dijkstra_field` (see there for the
+        full parameter and return documentation), with ``voxels`` and
+        ``index_kind`` fixed by the handle — the spatial index is reused,
+        not rebuilt.
+        """
+        dist, pred, _ = self._field(
+            sources,
+            node_cost=node_cost,
+            connectivity=connectivity,
+            anisotropy=anisotropy,
+            cost_mode=cost_mode,
+            free_mask=free_mask,
+            free_eps=free_eps,
+            min_only=min_only,
+            stop_mask=stop_mask,
+            stop_count=stop_count,
+        )
+        return dist, pred
+
+    def shortest_path_to_set(
+        self,
+        source: int,
+        stop_mask: npt.ArrayLike,
+        *,
+        node_cost: Optional[npt.ArrayLike] = None,
+        connectivity: int = 26,
+        anisotropy: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        cost_mode: str = "vertex",
+        free_mask: Optional[npt.ArrayLike] = None,
+        free_eps: float = 1e-6,
+    ) -> Tuple[np.ndarray, int, float]:
+        """Shortest path from ``source`` to the nearest ``stop_mask`` voxel.
+
+        Identical to the free :func:`shortest_path_to_set`, with ``voxels``
+        and ``index_kind`` fixed by the handle. This is the grafting
+        primitive that benefits most from the handle: each call skips the
+        ``O(N)`` index rebuild, leaving only the (early-terminating) search.
+        """
+        stop_mask = np.ascontiguousarray(stop_mask, dtype=bool)
+        dist, pred, hits = self._field(
+            source,
+            node_cost=node_cost,
+            connectivity=connectivity,
+            anisotropy=anisotropy,
+            cost_mode=cost_mode,
+            free_mask=free_mask,
+            free_eps=free_eps,
+            min_only=True,
+            stop_mask=stop_mask,
+            stop_count=1,
+        )
+        hit = int(hits[0])
+        if hit < 0:
+            return np.empty((0, 3), dtype=np.int32), -1, float("inf")
+        return path(self._voxels, pred, hit), hit, float(dist[hit])
+
+    def shortest_path(
+        self,
+        source: int,
+        target: int,
+        *,
+        node_cost: Optional[npt.ArrayLike] = None,
+        connectivity: int = 26,
+        anisotropy: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        cost_mode: str = "vertex",
+        free_mask: Optional[npt.ArrayLike] = None,
+        free_eps: float = 1e-6,
+    ) -> Tuple[np.ndarray, float]:
+        """Single ``source`` → ``target`` shortest path.
+
+        Identical to the free :func:`shortest_path`, with ``voxels`` and
+        ``index_kind`` fixed by the handle.
+        """
+        n = self.n
+        target = int(target)
+        if not 0 <= target < n:
+            raise ValueError(f"target index {target} out of range for {n} voxels")
+        stop_mask = np.zeros(n, dtype=bool)
+        stop_mask[target] = True
+        coords, _hit, cost = self.shortest_path_to_set(
+            source,
+            stop_mask,
+            node_cost=node_cost,
+            connectivity=connectivity,
+            anisotropy=anisotropy,
+            cost_mode=cost_mode,
+            free_mask=free_mask,
+            free_eps=free_eps,
+        )
+        return coords, cost
+
+    def connected_components(self, *, connectivity: int = 26) -> Tuple[int, np.ndarray]:
+        """Connected components of the handle's voxel set.
+
+        Identical to the free :func:`connected_components`, with ``voxels``
+        and ``index_kind`` fixed by the handle.
+        """
+        if connectivity not in _CONNECTIVITIES:
+            raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
+        return self._graph.connected_components(connectivity)
+
+    def index_of(self, coords: npt.ArrayLike, *, strict: bool = True) -> Union[int, np.ndarray]:
+        """Row indices of the given coordinates in the handle's voxels.
+
+        Identical to the free :func:`index_of`, with ``voxels`` and
+        ``index_kind`` fixed by the handle.
+        """
+        q = np.asarray(coords)
+        single = q.ndim == 1
+        q = _as_voxels(np.atleast_2d(q))
+        out = self._graph.index_of(q)
+        if strict and out.size and out.min() < 0:
+            missing = q[out < 0]
+            raise KeyError(f"coordinates not present in voxels: {missing[:5].tolist()}")
+        return int(out[0]) if single else out
+
+    def path(
+        self,
+        pred: npt.ArrayLike,
+        target: int,
+        *,
+        dist: Optional[npt.ArrayLike] = None,
+    ) -> np.ndarray:
+        """Convenience for :func:`path` over the handle's voxels (a pure
+        predecessor walk — it never touches the spatial index)."""
+        return path(self._voxels, pred, target, dist=dist)
 
 
 def dijkstra_field(
@@ -229,9 +459,13 @@ def dijkstra_field(
         Predecessor row index into ``voxels`` on the shortest path back to
         the source; ``-1`` for sources and unreached voxels (SciPy's
         convention). Feed to :func:`path` to reconstruct paths.
+
+    See Also
+    --------
+    Graph : builds the spatial index once for repeated queries over the
+        same voxels — identical results without the per-call rebuild.
     """
-    dist, pred, _ = _dijkstra_impl(
-        voxels,
+    return Graph(voxels, index_kind=index_kind).dijkstra_field(
         sources,
         node_cost=node_cost,
         connectivity=connectivity,
@@ -242,9 +476,7 @@ def dijkstra_field(
         min_only=min_only,
         stop_mask=stop_mask,
         stop_count=stop_count,
-        index_kind=index_kind,
     )
-    return dist, pred
 
 
 def shortest_path_to_set(
@@ -296,26 +528,16 @@ def shortest_path_to_set(
     cost : float
         Path cost ``dist[hit]``; ``+inf`` if none is reachable.
     """
-    vox = _as_voxels(voxels)
-    stop_mask = np.ascontiguousarray(stop_mask, dtype=bool)
-    dist, pred, hits = _dijkstra_impl(
-        vox,
+    return Graph(voxels, index_kind=index_kind).shortest_path_to_set(
         source,
+        stop_mask,
         node_cost=node_cost,
         connectivity=connectivity,
         anisotropy=anisotropy,
         cost_mode=cost_mode,
         free_mask=free_mask,
         free_eps=free_eps,
-        min_only=True,
-        stop_mask=stop_mask,
-        stop_count=1,
-        index_kind=index_kind,
     )
-    hit = int(hits[0])
-    if hit < 0:
-        return np.empty((0, 3), dtype=np.int32), -1, float("inf")
-    return path(vox, pred, hit), hit, float(dist[hit])
 
 
 def shortest_path(
@@ -339,26 +561,16 @@ def shortest_path(
     an empty ``(0, 3)`` array and ``+inf`` (no exception). Other parameters
     as in :func:`dijkstra_field`.
     """
-    vox = _as_voxels(voxels)
-    n = vox.shape[0]
-    target = int(target)
-    if not 0 <= target < n:
-        raise ValueError(f"target index {target} out of range for {n} voxels")
-    stop_mask = np.zeros(n, dtype=bool)
-    stop_mask[target] = True
-    coords, hit, cost = shortest_path_to_set(
-        vox,
+    return Graph(voxels, index_kind=index_kind).shortest_path(
         source,
-        stop_mask,
+        target,
         node_cost=node_cost,
         connectivity=connectivity,
         anisotropy=anisotropy,
         cost_mode=cost_mode,
         free_mask=free_mask,
         free_eps=free_eps,
-        index_kind=index_kind,
     )
-    return coords, cost
 
 
 def path(
@@ -435,12 +647,7 @@ def connected_components(
     Returns ``(n_components, labels)`` with ``labels`` of shape ``(N,)``,
     int32.
     """
-    vox = _as_voxels(voxels)
-    if connectivity not in _CONNECTIVITIES:
-        raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
-    if index_kind not in _INDEX_KINDS:
-        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
-    return _native.connected_components(vox, connectivity, index_kind)
+    return Graph(voxels, index_kind=index_kind).connected_components(connectivity=connectivity)
 
 
 def index_of(
@@ -469,14 +676,4 @@ def index_of(
     -------
     An int for a single coordinate, else an ``(M,)`` int64 array.
     """
-    vox = _as_voxels(voxels)
-    if index_kind not in _INDEX_KINDS:
-        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
-    q = np.asarray(coords)
-    single = q.ndim == 1
-    q = _as_voxels(np.atleast_2d(q))
-    out = _native.index_of(vox, q, index_kind)
-    if strict and out.size and out.min() < 0:
-        missing = q[out < 0]
-        raise KeyError(f"coordinates not present in voxels: {missing[:5].tolist()}")
-    return int(out[0]) if single else out
+    return Graph(voxels, index_kind=index_kind).index_of(coords, strict=strict)

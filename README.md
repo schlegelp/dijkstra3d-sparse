@@ -102,7 +102,38 @@ path(voxels, pred, target, *, dist=None) -> (M, 3) int32   # source → target
 connected_components(voxels, *, connectivity=26) -> (n_components, labels)
 
 index_of(voxels, coords, *, strict=True) -> int | (M,) int64
+
+Graph(voxels, *, index_kind="hash")   # reusable handle, methods below
 ```
+
+### Reusable `Graph` handle
+
+Every free function above rebuilds the `coordinate → row` spatial index —
+the one `O(N)` setup cost — on each call. For **repeated queries over the
+same voxel set**, build a `Graph` once; it holds the index and exposes the
+same operations as methods, minus the `voxels`/`index_kind` arguments:
+
+```python
+g = ds.Graph(voxels, index_kind="hash")   # O(N) index build happens here, once
+
+dist, pred = g.dijkstra_field(0, cost_mode="geometric")     # reuses the index
+dist2, _   = g.dijkstra_field([3, 7], node_cost=penalty,    # different cost model,
+                              cost_mode="additive")         # same handle
+coords, hit, cost = g.shortest_path_to_set(q, anchors)      # grafting primitive
+n_comp, labels = g.connected_components()
+rows = g.index_of(coords)
+g.n, g.voxels, g.index_kind                                 # introspection
+```
+
+Only `voxels` and `index_kind` are fixed at construction — `connectivity`,
+`anisotropy`, `cost_mode`, `node_cost` and the masks stay per-call, so one
+handle serves queries with different cost models. Results are **identical**
+to the free functions (same code runs; only where the index is built moves),
+duplicate coordinates are rejected at construction, and the handle keeps its
+own copy of the coordinates, so it is unaffected by later mutation of the
+input array. The payoff scales with call count — grafting loops that issue
+one `shortest_path_to_set` per path are the motivating case (see
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)).
 
 ### Edge-cost model
 

@@ -155,6 +155,30 @@ def run_workload(task: str, n_target: int, index_kind: str) -> dict:
         extra["n_queries"] = n_queries
         extra["touched_first10_mean"] = float(np.mean(touched[:10]))
         extra["touched_last10_mean"] = float(np.mean(touched[-10:]))
+    elif task == "reuse":
+        # same voxels, K repeated queries: the free functions rebuild the
+        # spatial index on every call, one Graph handle builds it once.
+        # Anchors on every 64th voxel keep each early-terminating search
+        # tiny, so the per-call cost is dominated by the index build — the
+        # cost the handle amortizes (the TEASAR grafting regime).
+        import dijkstra3d_sparse as ds
+
+        rng = np.random.default_rng(2)
+        anchor = np.zeros(n, dtype=bool)
+        anchor[::64] = True
+        ks = [2, 5, 50]
+        queries = [int(q) for q in rng.integers(0, n, max(ks))]
+        for k in ks:
+            t1 = time.perf_counter()
+            for q in queries[:k]:
+                ds.shortest_path_to_set(vox, q, anchor, index_kind=index_kind)
+            extra[f"free_k{k}_seconds"] = time.perf_counter() - t1
+            t1 = time.perf_counter()
+            g = ds.Graph(vox, index_kind=index_kind)  # handle build is included
+            for q in queries[:k]:
+                g.shortest_path_to_set(q, anchor)
+            extra[f"graph_k{k}_seconds"] = time.perf_counter() - t1
+        extra["ks"] = ks
     else:
         raise ValueError(task)
     elapsed = time.perf_counter() - t0
@@ -205,7 +229,7 @@ def main() -> None:
     n_target = 200_000 if args.quick else 2_000_000
     runs = [("dijkstra", "sorted"), ("dijkstra", "hash"),
             ("components", "sorted"), ("components", "hash"),
-            ("scipy-csr", "-"), ("graft", "-")]
+            ("scipy-csr", "-"), ("graft", "-"), ("reuse", "hash")]
     results = []
     for task, kind in runs:
         r = run_in_subprocess(task, n_target, kind)
@@ -218,6 +242,7 @@ def main() -> None:
     r0 = results[0]
     scipy_r = next(r for r in results if r["task"] == "scipy-csr")
     graft_r = next(r for r in results if r["task"] == "graft")
+    reuse_r = next(r for r in results if r["task"] == "reuse")
     dense_bytes = r0["bbox_cells"] * DENSE_BYTES_PER_CELL
     lines = [
         "# Benchmark results",
@@ -255,6 +280,21 @@ def main() -> None:
         f"({100 * graft_r['touched_last10_mean'] / graft_r['n']:.1f}% of N). A full "
         f"field per query would touch 100% of N every time; the whole "
         f"{graft_r['n_queries']}-query loop ran in {graft_r['seconds']:.2f} s.",
+        "",
+        "`reuse` is the reusable `Graph` handle (hash index): K early-terminating",
+        "`shortest_path_to_set` queries over the same voxels (anchors on every 64th",
+        "voxel, so each search is tiny and per-call cost is dominated by the spatial-",
+        "index build). The free functions rebuild that index on every call; one",
+        "`Graph` builds it once (handle construction is included in its time):",
+        "",
+        "| K queries | free functions | one `Graph` + K calls | speedup |",
+        "|---|---|---|---|",
+    ]
+    for k in reuse_r["ks"]:
+        free_s = reuse_r[f"free_k{k}_seconds"]
+        graph_s = reuse_r[f"graph_k{k}_seconds"]
+        lines.append(f"| {k} | {free_s:.2f} s | {graph_s:.2f} s | {free_s / graph_s:.1f}x |")
+    lines += [
         "",
         f"Dense baseline for the same bounding box (dist f64 + pred i64 + visited u8 = "
         f"{DENSE_BYTES_PER_CELL} B/cell): **{fmt_bytes(dense_bytes)}** — "

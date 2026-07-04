@@ -40,6 +40,13 @@ impl IndexKind {
             )),
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexKind::Sorted => "sorted",
+            IndexKind::Hash => "hash",
+        }
+    }
 }
 
 #[derive(Debug)]
