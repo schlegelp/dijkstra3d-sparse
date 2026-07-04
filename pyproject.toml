@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dijkstra3d-sparse"
+version = "0.1.0"
+description = "Dijkstra shortest paths, distance fields and connected components over sparse (N, 3) voxel sets"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Philipp Schlegel" }]
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+keywords = ["dijkstra", "voxel", "sparse", "shortest-path", "skeleton", "distance-field"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Repository = "https://github.com/schlegelp/dijkstra3d-sparse"
+
+[project.optional-dependencies]
+test = ["pytest", "scipy"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "dijkstra3d_sparse._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

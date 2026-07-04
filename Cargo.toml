@@ -1,0 +1,20 @@
+[package]
+name = "dijkstra3d-sparse"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "GPL-3.0-or-later"
+description = "Shortest paths, distance fields and connected components over sparse 3D voxel sets"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["abi3-py39"] }
+numpy = "0.25"
+rustc-hash = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
