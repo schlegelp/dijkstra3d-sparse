@@ -31,11 +31,12 @@ __all__ = [
     "shortest_path_to_set",
     "path",
     "connected_components",
+    "label_adjacency",
     "index_of",
     "__version__",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 _COST_MODES = ("vertex", "additive", "geometric")
 _CONNECTIVITIES = (6, 18, 26)
@@ -78,6 +79,23 @@ def _as_node_cost(node_cost: npt.ArrayLike, n: int) -> np.ndarray:
             "node_cost must be finite and non-negative "
             "(negative costs violate the Dijkstra invariant)"
         )
+    return arr
+
+
+def _as_int_field(name: str, values: npt.ArrayLike, n: int) -> np.ndarray:
+    """Coerce a per-voxel integer field (``group``/``labels``) to (N,) int64.
+
+    Integer dtypes only: these are compared for *equality*, which floats
+    would make meaningless."""
+    arr = np.asarray(values)
+    if not np.issubdtype(arr.dtype, np.integer):
+        raise ValueError(
+            f"{name} must be an integer array (values are compared for equality), "
+            f"got dtype {arr.dtype}"
+        )
+    arr = np.ascontiguousarray(arr, dtype=np.int64)
+    if arr.shape != (n,):
+        raise ValueError(f"{name} must have shape (N,) = ({n},), got {arr.shape}")
     return arr
 
 
@@ -343,7 +361,12 @@ class Graph:
         )
         return coords, cost
 
-    def connected_components(self, *, connectivity: int = 26) -> Tuple[int, np.ndarray]:
+    def connected_components(
+        self,
+        *,
+        group: Optional[npt.ArrayLike] = None,
+        connectivity: int = 26,
+    ) -> Tuple[int, np.ndarray]:
         """Connected components of the handle's voxel set.
 
         Identical to the free :func:`connected_components`, with ``voxels``
@@ -351,7 +374,25 @@ class Graph:
         """
         if connectivity not in _CONNECTIVITIES:
             raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
-        return self._graph.connected_components(connectivity)
+        if group is not None:
+            group = _as_int_field("group", group, self.n)
+        return self._graph.connected_components(connectivity, group)
+
+    def label_adjacency(
+        self,
+        labels: npt.ArrayLike,
+        *,
+        connectivity: int = 26,
+    ) -> np.ndarray:
+        """Pairs of distinct labels that touch, over the handle's voxels.
+
+        Identical to the free :func:`label_adjacency`, with ``voxels`` and
+        ``index_kind`` fixed by the handle.
+        """
+        if connectivity not in _CONNECTIVITIES:
+            raise ValueError(f"connectivity must be one of {_CONNECTIVITIES}, got {connectivity}")
+        labels = _as_int_field("labels", labels, self.n)
+        return self._graph.label_adjacency(labels, connectivity).reshape(-1, 2)
 
     def index_of(self, coords: npt.ArrayLike, *, strict: bool = True) -> Union[int, np.ndarray]:
         """Row indices of the given coordinates in the handle's voxels.
@@ -635,19 +676,79 @@ def path(
 def connected_components(
     voxels: npt.ArrayLike,
     *,
+    group: Optional[npt.ArrayLike] = None,
     connectivity: int = 26,
     index_kind: str = "hash",
 ) -> Tuple[int, np.ndarray]:
     """Connected components of the sparse voxel set (union-find).
 
-    Two voxels are connected when their coordinates differ by one of the
-    ``connectivity`` neighbour offsets. Labels are dense ``0..n_components-1``
-    in order of first appearance by row, so output is deterministic.
+    Two voxels are connected when (a) their coordinates differ by one of the
+    ``connectivity`` neighbour offsets and (b) ``group`` is ``None`` or their
+    ``group`` values are equal. Labels are dense ``0..n_components-1`` in
+    order of first appearance by row, so output is deterministic.
 
-    Returns ``(n_components, labels)`` with ``labels`` of shape ``(N,)``,
-    int32.
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates.
+    group
+        Optional ``(N,)`` integer field. When given, only neighbours with
+        *equal* group values are connected — i.e. the components of the
+        sub-graph induced by each group value (e.g. the "rings" of a
+        geodesic level set, ``group = floor(dist / step)``). Grouping only
+        *constrains* unions: the same value occurring in two spatially
+        separate places still yields two components, and a voxel whose group
+        differs from all its neighbours' becomes a singleton. Integer dtypes
+        only — the values are compared for equality.
+    connectivity
+        6, 18 or 26.
+    index_kind
+        Spatial-index backend; see :func:`dijkstra_field`.
+
+    Returns
+    -------
+    ``(n_components, labels)`` with ``labels`` of shape ``(N,)``, int32.
     """
-    return Graph(voxels, index_kind=index_kind).connected_components(connectivity=connectivity)
+    return Graph(voxels, index_kind=index_kind).connected_components(
+        group=group, connectivity=connectivity
+    )
+
+
+def label_adjacency(
+    voxels: npt.ArrayLike,
+    labels: npt.ArrayLike,
+    *,
+    connectivity: int = 26,
+    index_kind: str = "hash",
+) -> np.ndarray:
+    """Which pairs of distinct labels touch, without building an edge list.
+
+    For every pair of ``connectivity``-adjacent voxels ``u, v`` with
+    ``labels[u] != labels[v]``, the pair is emitted once. This contracts the
+    voxel graph onto the label graph — the quotient/adjacency graph of a
+    labelling such as :func:`connected_components` output — in one pass over
+    the implicit grid, deduplicating as it goes. The intermediate adjacency
+    count never materializes.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates.
+    labels
+        ``(N,)`` integer label per voxel. Need *not* be dense or
+        non-negative — any integer labelling works.
+    connectivity
+        6, 18 or 26.
+    index_kind
+        Spatial-index backend; see :func:`dijkstra_field`.
+
+    Returns
+    -------
+    ``(K, 2)`` int64 array of distinct pairs ``(lo, hi)`` with ``lo < hi``,
+    lexicographically sorted (deterministic). Empty input or a single label
+    gives a well-formed ``(0, 2)`` array.
+    """
+    return Graph(voxels, index_kind=index_kind).label_adjacency(labels, connectivity=connectivity)
 
 
 def index_of(

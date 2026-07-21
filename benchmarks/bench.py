@@ -103,6 +103,88 @@ def build_csr(vox: np.ndarray, connectivity: int = 26):
     )
 
 
+def edge_pairs(vox: np.ndarray, connectivity: int = 26) -> np.ndarray:
+    """Explicit undirected edge list `(E, 2)` of the implicit grid, built the
+    way a caller without `connected_components(group=...)` /
+    `label_adjacency` has to build it: vectorized sorted-key probes."""
+    v = (vox - vox.min(axis=0)).astype(np.int64) + 1
+    extent = v.max(axis=0) + 2
+
+    def pack(a):
+        return (a[:, 0] * extent[1] + a[:, 1]) * extent[2] + a[:, 2]
+
+    keys = pack(v)
+    order = np.argsort(keys).astype(np.int32)
+    skeys = keys[order]
+
+    max_manhattan = {6: 1, 18: 2, 26: 3}[connectivity]
+    src, dst = [], []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                manhattan = abs(dx) + abs(dy) + abs(dz)
+                if manhattan == 0 or manhattan > max_manhattan:
+                    continue
+                nkeys = pack(v + (dx, dy, dz))
+                pos = np.minimum(np.searchsorted(skeys, nkeys), len(skeys) - 1)
+                found = skeys[pos] == nkeys
+                src.append(np.nonzero(found)[0].astype(np.int64))
+                dst.append(order[pos[found]].astype(np.int64))
+    return np.stack([np.concatenate(src), np.concatenate(dst)], axis=1)
+
+
+def wavefront_stages(vox: np.ndarray, backend: str, index_kind: str, step: float = 20.0) -> dict:
+    """The wavefront-skeletonization graph pipeline: components -> geodesic
+    field -> components of each level set ("rings") -> which rings touch.
+
+    `backend="d3s"` runs it through the coordinate-native primitives;
+    `backend="edges"` through the explicit edge list + SciPy/NumPy, which is
+    what a caller has to do without them. Both must agree on the ring count.
+    """
+    import dijkstra3d_sparse as ds
+
+    n = len(vox)
+    extra = {}
+    t0 = time.perf_counter()
+    g = ds.Graph(vox, index_kind=index_kind)
+    n_comp, comp = g.connected_components()
+    seeds = [int(np.flatnonzero(comp == c)[0]) for c in range(n_comp)]
+    dist, _ = g.dijkstra_field(seeds, cost_mode="geometric")
+    lvl = np.floor(np.where(np.isfinite(dist), dist, 0.0) / step).astype(np.int64)
+    extra["field_seconds"] = time.perf_counter() - t0
+    extra["rss_after_field_bytes"] = peak_rss_bytes()
+
+    t1 = time.perf_counter()
+    if backend == "d3s":
+        n_rings, rings = g.connected_components(group=lvl)
+        extra["rings_seconds"] = time.perf_counter() - t1
+        t2 = time.perf_counter()
+        sk_edges = g.label_adjacency(rings)
+        extra["contract_seconds"] = time.perf_counter() - t2
+    else:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components as scipy_cc
+
+        e = edge_pairs(vox, 26)
+        extra["edge_list_seconds"] = time.perf_counter() - t1
+        extra["n_edges"] = len(e)
+        t2 = time.perf_counter()
+        same = e[lvl[e[:, 0]] == lvl[e[:, 1]]]
+        n_rings, rings = scipy_cc(
+            coo_matrix((np.ones(len(same), dtype=np.int8), (same[:, 0], same[:, 1])), shape=(n, n)),
+            directed=False,
+        )
+        extra["rings_seconds"] = time.perf_counter() - t2
+        t3 = time.perf_counter()
+        pairs = np.sort(rings[e].astype(np.int64), axis=1)
+        sk_edges = np.unique(pairs[pairs[:, 0] != pairs[:, 1]], axis=0)
+        extra["contract_seconds"] = time.perf_counter() - t3
+
+    extra["n_rings"] = int(n_rings)
+    extra["n_ring_edges"] = int(len(sk_edges))
+    return extra
+
+
 def run_workload(task: str, n_target: int, index_kind: str) -> dict:
     vox = helix_tube(n_target)
     n = len(vox)
@@ -179,6 +261,10 @@ def run_workload(task: str, n_target: int, index_kind: str) -> dict:
                 g.shortest_path_to_set(q, anchor)
             extra[f"graph_k{k}_seconds"] = time.perf_counter() - t1
         extra["ks"] = ks
+    elif task in ("wavefront", "wavefront-edges"):
+        extra.update(
+            wavefront_stages(vox, "d3s" if task == "wavefront" else "edges", index_kind)
+        )
     else:
         raise ValueError(task)
     elapsed = time.perf_counter() - t0
@@ -229,7 +315,8 @@ def main() -> None:
     n_target = 200_000 if args.quick else 2_000_000
     runs = [("dijkstra", "sorted"), ("dijkstra", "hash"),
             ("components", "sorted"), ("components", "hash"),
-            ("scipy-csr", "-"), ("graft", "-"), ("reuse", "hash")]
+            ("scipy-csr", "-"), ("graft", "-"), ("reuse", "hash"),
+            ("wavefront", "hash"), ("wavefront-edges", "hash")]
     results = []
     for task, kind in runs:
         r = run_in_subprocess(task, n_target, kind)
@@ -243,6 +330,14 @@ def main() -> None:
     scipy_r = next(r for r in results if r["task"] == "scipy-csr")
     graft_r = next(r for r in results if r["task"] == "graft")
     reuse_r = next(r for r in results if r["task"] == "reuse")
+    wave_r = next(r for r in results if r["task"] == "wavefront")
+    wave_e = next(r for r in results if r["task"] == "wavefront-edges")
+    # the two wavefront backends must agree — this is a correctness check on
+    # the coordinate-native primitives at benchmark scale, not just a timing
+    assert (wave_r["n_rings"], wave_r["n_ring_edges"]) == (
+        wave_e["n_rings"],
+        wave_e["n_ring_edges"],
+    ), f"wavefront backends disagree: {wave_r} vs {wave_e}"
     dense_bytes = r0["bbox_cells"] * DENSE_BYTES_PER_CELL
     lines = [
         "# Benchmark results",
@@ -296,6 +391,34 @@ def main() -> None:
         lines.append(f"| {k} | {free_s:.2f} s | {graph_s:.2f} s | {free_s / graph_s:.1f}x |")
     lines += [
         "",
+        "`wavefront` is the graph half of wavefront skeletonization over one",
+        "`Graph`: components → geodesic field → components of each geodesic level",
+        "set (`connected_components(group=level)`) → which of those rings touch",
+        "(`label_adjacency`). `wavefront-edges` is the same pipeline for a caller",
+        "without those two primitives: the explicit edge list, SciPy connected",
+        "components on the same-level sub-graph, and a NumPy `unique` to contract.",
+        "Both agree on the result "
+        f"({wave_r['n_rings']:,} rings, {wave_r['n_ring_edges']:,} ring edges); the",
+        "field stage is shared and identical.",
+        "",
+        "| stage | coordinate-native | edge list |",
+        "|---|---|---|",
+        f"| components + geodesic field | {wave_r['field_seconds']:.2f} s "
+        f"| {wave_e['field_seconds']:.2f} s |",
+        f"| edge list ({wave_e['n_edges']:,} rows) | — | {wave_e['edge_list_seconds']:.2f} s |",
+        f"| rings (components per level) | {wave_r['rings_seconds']:.2f} s "
+        f"| {wave_e['rings_seconds']:.2f} s |",
+        f"| contract onto rings | {wave_r['contract_seconds']:.2f} s "
+        f"| {wave_e['contract_seconds']:.2f} s |",
+        f"| **total** | **{wave_r['seconds']:.2f} s** | **{wave_e['seconds']:.2f} s** |",
+        f"| **peak RSS** | **{fmt_bytes(wave_r['peak_rss_bytes'])}** "
+        f"| **{fmt_bytes(wave_e['peak_rss_bytes'])}** |",
+        "",
+        f"The edge list is the entire difference: "
+        f"{wave_e['n_edges']:,} adjacencies materialized to yield "
+        f"{wave_r['n_ring_edges']:,} distinct ring pairs. `label_adjacency`",
+        "deduplicates as it probes, so that intermediate never exists.",
+        "",
         f"Dense baseline for the same bounding box (dist f64 + pred i64 + visited u8 = "
         f"{DENSE_BYTES_PER_CELL} B/cell): **{fmt_bytes(dense_bytes)}** — "
         f"{dense_bytes / max(r['peak_rss_bytes'] for r in results):,.0f}x the "
@@ -308,7 +431,7 @@ def main() -> None:
 
     # ---- the memory gate itself (our runs only; the CSR baseline is *expected*
     # to blow past it — that is the point of the comparison) ----
-    ours = [r for r in results if r["task"] != "scipy-csr"]
+    ours = [r for r in results if r["task"] not in ("scipy-csr", "wavefront-edges")]
     worst = max(r["peak_rss_bytes"] for r in ours)
     assert worst < 0.01 * dense_bytes, (
         f"peak RSS {fmt_bytes(worst)} is not << dense baseline {fmt_bytes(dense_bytes)}"

@@ -1,7 +1,8 @@
-//! Connected components over the implicit sparse grid via union-find.
-//! Uses the same neighbour probe as Dijkstra — no edge list is built.
+//! Connected components and label adjacency over the implicit sparse grid.
+//! Both walk the same neighbour probe as Dijkstra — no edge list is built.
 
 use crate::index::{key_of, SpatialIndex};
+use rustc_hash::FxHashSet;
 
 struct Dsu {
     parent: Vec<u32>,
@@ -42,17 +43,18 @@ impl Dsu {
     }
 }
 
-/// Label the connected components of the voxel set. Labels are assigned in
-/// order of first appearance by row index (0, 1, 2, ...), so the output is
-/// deterministic. Returns `(n_components, labels)`.
-pub fn connected_components(
+/// Visit every undirected neighbour pair `(row, nbr)` of the implicit grid
+/// exactly once. Shared by `connected_components` and `label_adjacency` —
+/// the only place the neighbour probe is written.
+fn for_each_adjacent_pair<F>(
     coords: &[i32],
     n: usize,
     index: &SpatialIndex,
     offsets: &[(i32, i32, i32, f64)],
-) -> (usize, Vec<i32>) {
-    let mut dsu = Dsu::new(n);
-
+    mut visit: F,
+) where
+    F: FnMut(usize, usize),
+{
     // Each undirected neighbour pair only needs probing once: keep the
     // lexicographically-positive half of the (symmetric) offset set.
     let half: Vec<(i32, i32, i32)> = offsets
@@ -78,10 +80,38 @@ pub fn connected_components(
                 continue;
             }
             if let Some(nbr) = index.get(key_of(nx as i32, ny as i32, nz as i32)) {
-                dsu.union(row as u32, nbr);
+                visit(row, nbr as usize);
             }
         }
     }
+}
+
+/// Label the connected components of the voxel set. Labels are assigned in
+/// order of first appearance by row index (0, 1, 2, ...), so the output is
+/// deterministic. Returns `(n_components, labels)`.
+///
+/// With `group`, two coordinate-adjacent voxels are only connected when
+/// their group values are equal — i.e. the components of the sub-graph
+/// induced by each group value. Grouping *constrains* unions; it never
+/// merges spatially separate runs that happen to share a value. Voxels
+/// whose group differs from all their neighbours' become singletons.
+pub fn connected_components(
+    coords: &[i32],
+    n: usize,
+    index: &SpatialIndex,
+    offsets: &[(i32, i32, i32, f64)],
+    group: Option<&[i64]>,
+) -> (usize, Vec<i32>) {
+    let mut dsu = Dsu::new(n);
+
+    for_each_adjacent_pair(coords, n, index, offsets, |row, nbr| {
+        if let Some(g) = group {
+            if g[row] != g[nbr] {
+                return;
+            }
+        }
+        dsu.union(row as u32, nbr as u32);
+    });
 
     let mut labels = vec![-1i32; n];
     let mut root_label = vec![-1i32; n];
@@ -95,6 +125,35 @@ pub fn connected_components(
         *label = root_label[root];
     }
     (next as usize, labels)
+}
+
+/// Which pairs of *distinct* labels touch: for every adjacent voxel pair
+/// `(u, v)` with `labels[u] != labels[v]`, the pair `(lo, hi)`. Returns
+/// deduplicated, lexicographically sorted pairs.
+///
+/// The set is deduplicated *as adjacencies are found*, never collected
+/// first: the caller's point is to avoid materializing the edge list, and
+/// on real inputs the distinct-pair count is orders of magnitude below the
+/// adjacency count.
+pub fn label_adjacency(
+    coords: &[i32],
+    n: usize,
+    index: &SpatialIndex,
+    offsets: &[(i32, i32, i32, f64)],
+    labels: &[i64],
+) -> Vec<(i64, i64)> {
+    let mut seen: FxHashSet<(i64, i64)> = FxHashSet::default();
+
+    for_each_adjacent_pair(coords, n, index, offsets, |row, nbr| {
+        let (a, b) = (labels[row], labels[nbr]);
+        if a != b {
+            seen.insert(if a < b { (a, b) } else { (b, a) });
+        }
+    });
+
+    let mut out: Vec<(i64, i64)> = seen.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]
@@ -111,13 +170,66 @@ mod tests {
         let index = SpatialIndex::build(&coords, 3, IndexKind::Sorted).unwrap();
 
         let offs26 = build_offsets(26, [1.0; 3]);
-        let (n, labels) = connected_components(&coords, 3, &index, &offs26);
+        let (n, labels) = connected_components(&coords, 3, &index, &offs26, None);
         assert_eq!(n, 2);
         assert_eq!(labels, vec![0, 0, 1]);
 
         let offs6 = build_offsets(6, [1.0; 3]);
-        let (n, labels) = connected_components(&coords, 3, &index, &offs6);
+        let (n, labels) = connected_components(&coords, 3, &index, &offs6, None);
         assert_eq!(n, 3);
         assert_eq!(labels, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn group_splits_a_run_but_does_not_merge_by_value() {
+        // A straight 6-voxel line. Grouping splits it at the value change...
+        let coords: Vec<i32> = (0..6).flat_map(|x| [x, 0, 0]).collect();
+        let index = SpatialIndex::build(&coords, 6, IndexKind::Hash).unwrap();
+        let offs = build_offsets(26, [1.0; 3]);
+
+        let (n, labels) =
+            connected_components(&coords, 6, &index, &offs, Some(&[0, 0, 0, 1, 1, 1]));
+        assert_eq!(n, 2);
+        assert_eq!(labels, vec![0, 0, 0, 1, 1, 1]);
+
+        // ...but the same value in two spatially separate runs stays two
+        // components: grouping constrains unions, it does not merge.
+        let (n, labels) =
+            connected_components(&coords, 6, &index, &offs, Some(&[0, 0, 1, 1, 0, 0]));
+        assert_eq!(n, 3);
+        assert_eq!(labels, vec![0, 0, 1, 1, 2, 2]);
+
+        // A uniform group is indistinguishable from no group at all.
+        let uniform = connected_components(&coords, 6, &index, &offs, Some(&[7; 6]));
+        assert_eq!(
+            uniform,
+            connected_components(&coords, 6, &index, &offs, None)
+        );
+    }
+
+    #[test]
+    fn adjacency_pairs_are_deduped_sorted_and_connectivity_sensitive() {
+        // A line of 4 alternating between two (negative, non-dense) labels:
+        // three inter-label adjacencies collapse to one distinct pair.
+        let coords: Vec<i32> = (0..4).flat_map(|x| [x, 0, 0]).collect();
+        let index = SpatialIndex::build(&coords, 4, IndexKind::Hash).unwrap();
+        let offs = build_offsets(6, [1.0; 3]);
+        let pairs = label_adjacency(&coords, 4, &index, &offs, &[-5, 9, -5, 9]);
+        assert_eq!(pairs, vec![(-5, 9)]);
+
+        // Same label everywhere -> no pairs at all.
+        assert!(label_adjacency(&coords, 4, &index, &offs, &[3; 4]).is_empty());
+
+        // Diagonal touch only counts at 18/26-connectivity.
+        let diag: Vec<i32> = vec![0, 0, 0, 1, 1, 0];
+        let index = SpatialIndex::build(&diag, 2, IndexKind::Sorted).unwrap();
+        let labels = [2i64, 1];
+        let offs26 = build_offsets(26, [1.0; 3]);
+        assert_eq!(
+            label_adjacency(&diag, 2, &index, &offs26, &labels),
+            vec![(1, 2)]
+        );
+        let offs6 = build_offsets(6, [1.0; 3]);
+        assert!(label_adjacency(&diag, 2, &index, &offs6, &labels).is_empty());
     }
 }

@@ -19,8 +19,15 @@ def dijkstra_field(
 def connected_components(
     voxels: np.ndarray,
     connectivity: int,
+    group: Optional[np.ndarray],
     index_kind: str,
 ) -> Tuple[int, np.ndarray]: ...
+def label_adjacency(
+    voxels: np.ndarray,
+    labels: np.ndarray,
+    connectivity: int,
+    index_kind: str,
+) -> np.ndarray: ...
 def index_of(
     voxels: np.ndarray,
     queries: np.ndarray,

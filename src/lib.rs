@@ -285,29 +285,72 @@ fn dijkstra_field<'py>(
 }
 
 /// Connected components over the implicit sparse grid (union-find).
+/// With `group`, only neighbours whose group value matches are unioned.
 #[pyfunction]
-#[pyo3(signature = (voxels, connectivity, index_kind))]
+#[pyo3(signature = (voxels, connectivity, group, index_kind))]
 fn connected_components<'py>(
     py: Python<'py>,
     voxels: PyReadonlyArray2<'py, i32>,
     connectivity: u8,
+    group: Option<PyReadonlyArray1<'py, i64>>,
     index_kind: &str,
 ) -> PyResult<(usize, Bound<'py, PyArray1<i32>>)> {
     let (coords, n) = coords_slice(&voxels)?;
     let kind = IndexKind::parse(index_kind).map_err(err)?;
     check_connectivity(connectivity)?;
+    // Bind the borrow outside the closure: it has to outlive `allow_threads`.
+    let group = per_voxel_slice("group", group.as_ref(), n)?;
 
     let (n_components, labels) = py
         .allow_threads(|| -> Result<(usize, Vec<i32>), String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             let offsets = build_offsets(connectivity, [1.0; 3]);
             Ok(components::connected_components(
-                coords, n, &sindex, &offsets,
+                coords, n, &sindex, &offsets, group,
             ))
         })
         .map_err(err)?;
 
     Ok((n_components, labels.into_pyarray(py)))
+}
+
+/// Pairs of distinct labels that touch, as a flat `[lo, hi, lo, hi, ...]`
+/// vector (the Python wrapper reshapes it to `(K, 2)`).
+#[pyfunction]
+#[pyo3(signature = (voxels, labels, connectivity, index_kind))]
+fn label_adjacency<'py>(
+    py: Python<'py>,
+    voxels: PyReadonlyArray2<'py, i32>,
+    labels: PyReadonlyArray1<'py, i64>,
+    connectivity: u8,
+    index_kind: &str,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let (coords, n) = coords_slice(&voxels)?;
+    let kind = IndexKind::parse(index_kind).map_err(err)?;
+    check_connectivity(connectivity)?;
+    let labels = per_voxel_slice("labels", Some(&labels), n)?.unwrap();
+
+    let out = py
+        .allow_threads(|| -> Result<Vec<i64>, String> {
+            let sindex = SpatialIndex::build(coords, n, kind)?;
+            let offsets = build_offsets(connectivity, [1.0; 3]);
+            Ok(flatten_pairs(components::label_adjacency(
+                coords, n, &sindex, &offsets, labels,
+            )))
+        })
+        .map_err(err)?;
+
+    Ok(out.into_pyarray(py))
+}
+
+/// `[(lo, hi), ...]` -> flat `[lo, hi, lo, hi, ...]` for the NumPy boundary.
+fn flatten_pairs(pairs: Vec<(i64, i64)>) -> Vec<i64> {
+    let mut out = Vec::with_capacity(pairs.len() * 2);
+    for (lo, hi) in pairs {
+        out.push(lo);
+        out.push(hi);
+    }
+    out
 }
 
 /// Row index in `voxels` for each coordinate in `queries`; -1 if absent.
@@ -422,17 +465,42 @@ impl Graph {
     }
 
     /// `connected_components` minus `voxels`/`index_kind`.
+    #[pyo3(signature = (connectivity, group=None))]
     fn connected_components<'py>(
         &self,
         py: Python<'py>,
         connectivity: u8,
+        group: Option<PyReadonlyArray1<'py, i64>>,
     ) -> PyResult<(usize, Bound<'py, PyArray1<i32>>)> {
         check_connectivity(connectivity)?;
+        let group = per_voxel_slice("group", group.as_ref(), self.n)?;
         let (n_components, labels) = py.allow_threads(|| {
             let offsets = build_offsets(connectivity, [1.0; 3]);
-            components::connected_components(&self.coords, self.n, &self.index, &offsets)
+            components::connected_components(&self.coords, self.n, &self.index, &offsets, group)
         });
         Ok((n_components, labels.into_pyarray(py)))
+    }
+
+    /// `label_adjacency` minus `voxels`/`index_kind`.
+    fn label_adjacency<'py>(
+        &self,
+        py: Python<'py>,
+        labels: PyReadonlyArray1<'py, i64>,
+        connectivity: u8,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        check_connectivity(connectivity)?;
+        let labels = per_voxel_slice("labels", Some(&labels), self.n)?.unwrap();
+        let out = py.allow_threads(|| {
+            let offsets = build_offsets(connectivity, [1.0; 3]);
+            flatten_pairs(components::label_adjacency(
+                &self.coords,
+                self.n,
+                &self.index,
+                &offsets,
+                labels,
+            ))
+        });
+        Ok(out.into_pyarray(py))
     }
 
     /// `index_of` minus `voxels`/`index_kind`.
@@ -451,6 +519,7 @@ impl Graph {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dijkstra_field, m)?)?;
     m.add_function(wrap_pyfunction!(connected_components, m)?)?;
+    m.add_function(wrap_pyfunction!(label_adjacency, m)?)?;
     m.add_function(wrap_pyfunction!(index_of, m)?)?;
     m.add_class::<Graph>()?;
     Ok(())

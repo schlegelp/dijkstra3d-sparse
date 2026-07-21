@@ -99,7 +99,10 @@ shortest_path_to_set(voxels, source, stop_mask, **kw) -> (path, hit, cost)
 
 path(voxels, pred, target, *, dist=None) -> (M, 3) int32   # source → target
 
-connected_components(voxels, *, connectivity=26) -> (n_components, labels)
+connected_components(voxels, *, group=None,
+                     connectivity=26) -> (n_components, labels)
+
+label_adjacency(voxels, labels, *, connectivity=26) -> (K, 2) int64
 
 index_of(voxels, coords, *, strict=True) -> int | (M,) int64
 
@@ -121,6 +124,8 @@ dist2, _   = g.dijkstra_field([3, 7], node_cost=penalty,    # different cost mod
                               cost_mode="additive")         # same handle
 coords, hit, cost = g.shortest_path_to_set(q, anchors)      # grafting primitive
 n_comp, labels = g.connected_components()
+n_rings, rings = g.connected_components(group=level)        # components per group
+ring_edges = g.label_adjacency(rings)                       # which rings touch
 rows = g.index_of(coords)
 g.n, g.voxels, g.index_kind                                 # introspection
 ```
@@ -201,6 +206,43 @@ touches the anchor set". It is also the recommended replacement for
 `free_mask`-based grafting tricks — cleaner (no cost distortion) and
 cheaper (early exit); if both are given they stay independent (`free_mask`
 changes edge costs, `stop_mask` only changes termination).
+
+### Graph contraction without an edge list
+
+Two primitives run over the same implicit-grid probe as everything else, so
+a caller can *contract* the voxel graph — collapse voxels into groups, then
+ask which groups touch — without ever materializing adjacencies:
+
+- **`connected_components(voxels, group=values)`** connects two voxels only
+  when they are `connectivity`-adjacent **and** `group[u] == group[v]`, i.e.
+  the components of the sub-graph induced by each group value. Grouping only
+  *constrains* unions: the same value in two spatially separate places stays
+  two components, and a voxel whose group differs from all its neighbours'
+  becomes a singleton. `group=None` is the plain component labelling.
+- **`label_adjacency(voxels, labels)`** returns the distinct pairs of
+  *different* labels that touch, as a sorted `(K, 2)` array — the edges of
+  the quotient graph. It deduplicates during the probe, so the (typically
+  enormous) intermediate adjacency count never exists. `labels` need not be
+  dense or non-negative.
+
+Together they express level-set / Reeb-graph constructions such as wavefront
+skeletonization in three passes over one `Graph`:
+
+```python
+g = ds.Graph(voxels)
+n_comp, comp = g.connected_components()                    # one wave per component
+seeds = [int(np.flatnonzero(comp == c)[0]) for c in range(n_comp)]
+dist, _ = g.dijkstra_field(seeds, cost_mode="geometric")
+
+level = np.floor(dist / step_size).astype(np.int64)        # geodesic level sets
+n_rings, rings = g.connected_components(group=level)       # rings = level components
+skeleton_edges = g.label_adjacency(rings)                  # contract onto rings
+```
+
+On the benchmark tube (1.5M voxels) that pipeline runs in 1.1 s at 514 MiB
+peak RSS, versus 5.7 s at 3.6 GiB for the same result via an explicit edge
+list plus SciPy — 30.5M adjacencies materialized to yield 2,429 distinct
+ring pairs (see [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)).
 
 ### Notes
 
