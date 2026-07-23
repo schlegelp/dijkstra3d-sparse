@@ -106,6 +106,9 @@ label_adjacency(voxels, labels, *, connectivity=26) -> (K, 2) int64
 
 exposed_faces(voxels, *, index_kind="hash") -> (N,) uint8   # surface-face mask
 
+factorize(voxels, *, return_index=False,                    # dedup coords -> labels
+          index_kind="hash") -> (n_labels, labels[, reps])
+
 index_of(voxels, coords, *, strict=True) -> int | (M,) int64
 
 Graph(voxels, *, index_kind="hash")   # reusable handle, methods below
@@ -264,6 +267,29 @@ the spatial index, runs the probe, and frees the index inside the one call, so
 the surface pass leaves nothing behind for a later stage's peak to stack on.
 (`Graph.exposed_faces()` exists too, but reuses — and keeps — the handle's
 index, so it gives up that transient-memory win.)
+
+### Deduplicating coordinates
+
+**`factorize(voxels)`** is the sparse `np.unique(coords, axis=0,
+return_inverse=True)`: it assigns every row a dense label, equal exactly when
+the coordinates are equal, in one hash pass instead of a sort. It is the *only*
+primitive here that **accepts duplicate coordinates** — collapsing them is the
+whole point (the others reject repeats).
+
+```python
+n, labels = ds.factorize(cells)                      # (E, 3) with repeats -> labels
+n, labels, reps = ds.factorize(cells, return_index=True)
+unique = cells[reps]                                 # one row per label...
+assert np.array_equal(unique[labels], cells)         # ...and labels index back
+```
+
+Labels are `0 .. n-1` in order of first appearance by row; `reps[k]` is the
+first row carrying label `k`. This is the dedup a voxel mesher runs on its
+per-quad corners, and the coarse-cell assignment (`fine // scale`) a downsampler
+runs on its nodes — the same operation, so it lives here rather than as a
+hand-rolled `argsort` in each caller. It groups by exact coordinate equality,
+which is a different question from `connected_components` (spatial adjacency,
+unique input) despite the shared `(n, labels)` return.
 
 ### Notes
 

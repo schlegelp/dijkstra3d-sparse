@@ -10,6 +10,7 @@
 //! `Graph` pyclass builds it once at construction and reuses it.
 
 mod components;
+mod dedup;
 mod dijkstra;
 mod index;
 mod offsets;
@@ -37,6 +38,14 @@ type FieldArrays<'py> = (
 
 /// `(dist, pred, hits)` as plain vectors, produced inside `allow_threads`.
 type FieldVecs = (Vec<f64>, Vec<i64>, Vec<i64>);
+
+/// `(n_labels, labels, reps)` output of `factorize`; `reps` is `None` unless
+/// `return_index` was requested.
+type FactorizeArrays<'py> = (
+    usize,
+    Bound<'py, PyArray1<i64>>,
+    Option<Bound<'py, PyArray1<i64>>>,
+);
 
 /// Extract `(coords_slice, n)` from an `(N, 3)` C-contiguous array.
 fn coords_slice<'a>(voxels: &'a PyReadonlyArray2<'a, i32>) -> PyResult<(&'a [i32], usize)> {
@@ -370,6 +379,33 @@ fn exposed_faces<'py>(
     Ok(mask.into_pyarray(py))
 }
 
+/// Dense per-row labels for coordinates by exact equality (duplicates
+/// collapse) — the sparse `np.unique(..., return_inverse=True)`, done as one
+/// hash pass instead of a sort. Returns `(n_labels, labels, reps)`; `reps` is
+/// `None` unless `return_index`. Unlike `Graph`/`index_of`/`connected_components`,
+/// this *accepts* duplicated input — that is its whole reason to exist.
+#[pyfunction]
+#[pyo3(signature = (voxels, return_index, index_kind))]
+fn factorize<'py>(
+    py: Python<'py>,
+    voxels: PyReadonlyArray2<'py, i32>,
+    return_index: bool,
+    index_kind: &str,
+) -> PyResult<FactorizeArrays<'py>> {
+    let (coords, n) = coords_slice(&voxels)?;
+    // Validated for signature parity with the other free functions; factorize
+    // is a single hash pass, so the backend does not change its result.
+    IndexKind::parse(index_kind).map_err(err)?;
+
+    let (n_labels, labels, reps) = py.allow_threads(|| dedup::factorize(coords, n, return_index));
+
+    Ok((
+        n_labels,
+        labels.into_pyarray(py),
+        reps.map(|r| r.into_pyarray(py)),
+    ))
+}
+
 /// `[(lo, hi), ...]` -> flat `[lo, hi, lo, hi, ...]` for the NumPy boundary.
 fn flatten_pairs(pairs: Vec<(i64, i64)>) -> Vec<i64> {
     let mut out = Vec::with_capacity(pairs.len() * 2);
@@ -557,6 +593,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connected_components, m)?)?;
     m.add_function(wrap_pyfunction!(label_adjacency, m)?)?;
     m.add_function(wrap_pyfunction!(exposed_faces, m)?)?;
+    m.add_function(wrap_pyfunction!(factorize, m)?)?;
     m.add_function(wrap_pyfunction!(index_of, m)?)?;
     m.add_class::<Graph>()?;
     Ok(())

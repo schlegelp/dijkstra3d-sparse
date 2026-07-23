@@ -33,6 +33,7 @@ __all__ = [
     "connected_components",
     "label_adjacency",
     "exposed_faces",
+    "factorize",
     "index_of",
     "__version__",
 ]
@@ -819,6 +820,70 @@ def exposed_faces(
     # Deliberately *not* Graph(...).exposed_faces(): the native free function
     # frees the index inside the call, which the persistent handle cannot.
     return _native.exposed_faces(vox, index_kind)
+
+
+def factorize(
+    voxels: npt.ArrayLike,
+    *,
+    return_index: bool = False,
+    index_kind: str = "hash",
+) -> Union[Tuple[int, np.ndarray], Tuple[int, np.ndarray, np.ndarray]]:
+    """Dense labels for coordinates by exact equality; duplicates collapse.
+
+    The sparse analogue of ``np.unique(coords, axis=0, return_inverse=True)``,
+    computed as a single hash pass rather than a sort. Each row is assigned a
+    label, equal exactly when the coordinates are equal, so an array that is
+    mostly repeats (the four-corners-per-quad a mesher emits, the coarse cell
+    each fine voxel downsamples into) collapses to its distinct set with an
+    inverse mapping back to every row.
+
+    Unlike :class:`Graph`, :func:`index_of` and :func:`connected_components` —
+    which **reject** duplicate coordinates — this is *built for* duplicated
+    input: duplicates are the point, not an error. And unlike
+    :func:`connected_components`, which also returns ``(n, labels)`` but groups
+    by spatial *adjacency*, ``factorize`` groups by exact coordinate
+    *equality*; a caller holding already-unique coordinates does not need it.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer coordinates (any integer dtype in int32 range),
+        duplicates allowed. Negative coordinates work — the coordinates are
+        hashed as-is, so no non-negative shift is required.
+    return_index
+        If True, also return ``reps``: the row index of the first occurrence
+        of each label, so ``voxels[reps]`` is the deduplicated coordinate set,
+        aligned with the labels.
+    index_kind
+        Accepted for signature parity with the other free functions. The
+        factorize is always a single hash pass, so this does not change the
+        result (there is no ``Graph`` handle to build here).
+
+    Returns
+    -------
+    n_labels : int
+        Number of distinct coordinates.
+    labels : ``(N,)`` int64
+        Dense label per row, ``0 .. n_labels-1``, assigned in order of first
+        appearance by row. ``labels[i] == labels[j]`` iff ``voxels[i]`` and
+        ``voxels[j]`` are the same coordinate.
+    reps : ``(n_labels,)`` int64, *only if* ``return_index``
+        ``reps[k]`` is the first row with label ``k`` (strictly increasing, so
+        ``voxels[reps]`` lists the distinct coordinates in first-appearance
+        order). ``voxels[reps][labels]`` reconstructs ``voxels``.
+
+    Notes
+    -----
+    Exact integer equality only — no tolerance or rounding. ``N == 0`` returns
+    ``(0, empty)`` (or ``(0, empty, empty)`` with ``return_index``).
+    """
+    vox = _as_voxels(voxels)
+    if index_kind not in _INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
+    n_labels, labels, reps = _native.factorize(vox, bool(return_index), index_kind)
+    if return_index:
+        return n_labels, labels, reps
+    return n_labels, labels
 
 
 def index_of(
