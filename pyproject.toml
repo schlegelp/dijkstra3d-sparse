@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "dijkstra3d-sparse"
-version = "0.2.1"
+version = "0.2.2"
 description = "Dijkstra shortest paths, distance fields and connected components over sparse (N, 3) voxel sets"
 readme = "README.md"
 license = { file = "LICENSE" }
