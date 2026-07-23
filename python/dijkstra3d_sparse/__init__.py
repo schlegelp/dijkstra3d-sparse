@@ -32,6 +32,7 @@ __all__ = [
     "path",
     "connected_components",
     "label_adjacency",
+    "exposed_faces",
     "index_of",
     "__version__",
 ]
@@ -394,6 +395,18 @@ class Graph:
         labels = _as_int_field("labels", labels, self.n)
         return self._graph.label_adjacency(labels, connectivity).reshape(-1, 2)
 
+    def exposed_faces(self) -> np.ndarray:
+        """Per-voxel 6-bit mask of absent face-neighbours, over the handle's
+        voxels.
+
+        Identical result to the free :func:`exposed_faces`, but note the
+        memory trade-off is the opposite one: this reuses (and keeps) the
+        handle's index, so it does *not* free the index within the call. The
+        free function is the one whose whole point is a transient index — use
+        it, not a throwaway handle, when the surface pass is all you need.
+        """
+        return self._graph.exposed_faces()
+
     def index_of(self, coords: npt.ArrayLike, *, strict: bool = True) -> Union[int, np.ndarray]:
         """Row indices of the given coordinates in the handle's voxels.
 
@@ -749,6 +762,63 @@ def label_adjacency(
     gives a well-formed ``(0, 2)`` array.
     """
     return Graph(voxels, index_kind=index_kind).label_adjacency(labels, connectivity=connectivity)
+
+
+def exposed_faces(
+    voxels: npt.ArrayLike,
+    *,
+    index_kind: str = "hash",
+) -> np.ndarray:
+    """Per voxel, a 6-bit mask of which face-neighbours are absent from the set.
+
+    This is the surface-extraction probe: a face is *exposed* exactly when the
+    voxel one step across it is not itself a voxel. For each row it answers all
+    six face directions at once, as one bit each, so the caller can split the
+    result into directional sets (``voxels_left`` / ``voxels_right`` / …) with
+    cheap boolean gathers rather than six coordinate probes.
+
+    Unlike the other free functions in this module, this one does **not** route
+    through a :class:`Graph`: it builds the spatial index, runs the single
+    probing pass, and frees the index — all inside the native call, before the
+    output array is even handed back. That transient index is the entire point
+    (:meth:`Graph.exposed_faces` reuses a persistent one and so gives up the
+    memory win); it keeps the surface pass's own footprint from stacking under
+    a later peak.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates (any integer dtype in int32
+        range). Duplicate coordinates are rejected, as by :class:`Graph`.
+    index_kind
+        Spatial-index backend, ``"hash"`` (default) or ``"sorted"``; see
+        :func:`dijkstra_field`. Identical results, performance knob only.
+
+    Returns
+    -------
+    ``(N,)`` uint8 mask, row-aligned with ``voxels``. Bit ``k`` of ``mask[i]``
+    is set iff ``voxels[i] + FACE_OFFSET[k]`` is **not** in ``voxels``, where
+    the face offsets are, in bit order::
+
+        bit 0: (+1, 0, 0)   bit 1: (-1, 0, 0)
+        bit 2: (0, +1, 0)   bit 3: (0, -1, 0)
+        bit 4: (0, 0, +1)   bit 5: (0, 0, -1)
+
+    A fully interior voxel yields ``0``; a lone voxel yields ``0b111111``
+    (``63``). To recover the voxels with (say) their ``-x`` face exposed:
+    ``voxels[(mask & (1 << 1)) != 0]``.
+
+    Notes
+    -----
+    "Exposed face" is inherently a 6-connectivity notion, so there is no
+    ``connectivity`` parameter.
+    """
+    vox = _as_voxels(voxels)
+    if index_kind not in _INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
+    # Deliberately *not* Graph(...).exposed_faces(): the native free function
+    # frees the index inside the call, which the persistent handle cannot.
+    return _native.exposed_faces(vox, index_kind)
 
 
 def index_of(

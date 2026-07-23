@@ -104,6 +104,8 @@ connected_components(voxels, *, group=None,
 
 label_adjacency(voxels, labels, *, connectivity=26) -> (K, 2) int64
 
+exposed_faces(voxels, *, index_kind="hash") -> (N,) uint8   # surface-face mask
+
 index_of(voxels, coords, *, strict=True) -> int | (M,) int64
 
 Graph(voxels, *, index_kind="hash")   # reusable handle, methods below
@@ -126,6 +128,7 @@ coords, hit, cost = g.shortest_path_to_set(q, anchors)      # grafting primitive
 n_comp, labels = g.connected_components()
 n_rings, rings = g.connected_components(group=level)        # components per group
 ring_edges = g.label_adjacency(rings)                       # which rings touch
+face_mask = g.exposed_faces()                               # surface-face mask
 rows = g.index_of(coords)
 g.n, g.voxels, g.index_kind                                 # introspection
 ```
@@ -243,6 +246,24 @@ On the benchmark tube (1.5M voxels) that pipeline runs in 1.1 s at 514 MiB
 peak RSS, versus 5.7 s at 3.6 GiB for the same result via an explicit edge
 list plus SciPy — 30.5M adjacencies materialized to yield 2,429 distinct
 ring pairs (see [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md)).
+
+### Surface faces
+
+**`exposed_faces(voxels)`** answers, for every voxel in one pass, which of its
+six face-neighbours are *absent* from the set — the first stage of any voxel
+mesher / surface extraction. It returns an `(N,)` `uint8` mask, bit `k` set iff
+the neighbour across face `k` is missing, in the order `+x, -x, +y, -y, +z, -z`:
+
+```python
+mask = ds.exposed_faces(voxels)             # (N,) uint8; 0 = interior, 63 = isolated
+right = voxels[(mask & (1 << 0)) != 0]      # voxels whose +x face is exposed
+```
+
+Unlike the other free functions it does not route through a `Graph`: it builds
+the spatial index, runs the probe, and frees the index inside the one call, so
+the surface pass leaves nothing behind for a later stage's peak to stack on.
+(`Graph.exposed_faces()` exists too, but reuses — and keeps — the handle's
+index, so it gives up that transient-memory win.)
 
 ### Notes
 

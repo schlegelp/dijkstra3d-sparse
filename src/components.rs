@@ -127,6 +127,54 @@ pub fn connected_components(
     (next as usize, labels)
 }
 
+/// The six face-neighbour offsets, in the bit order `exposed_faces`
+/// reports: `+x, -x, +y, -y, +z, -z`. Bit `k` of a voxel's mask is set
+/// iff the neighbour at `FACES[k]` is absent from the set.
+const FACES: [(i32, i32, i32); 6] = [
+    (1, 0, 0),  // bit 0: +x
+    (-1, 0, 0), // bit 1: -x
+    (0, 1, 0),  // bit 2: +y
+    (0, -1, 0), // bit 3: -y
+    (0, 0, 1),  // bit 4: +z
+    (0, 0, -1), // bit 5: -z
+];
+
+/// Per voxel, a 6-bit mask of which face-neighbours are *absent* from the
+/// set. This is the surface-extraction probe `find_surface_voxels` runs —
+/// the same coordinate walk as `connected_components`, minus the union-find:
+/// one pass, no `(N, 3)` neighbour temporaries, and (in the free-function
+/// binding) the spatial index is built and freed within the call.
+///
+/// Bit `k` of `mask[row]` is set iff `voxels[row] + FACES[k]` is not in the
+/// set. A fully interior voxel yields `0`; a lone voxel yields `0b111111`
+/// (`63`). Directional by nature — the `half`-offset trick the pair
+/// primitives use does not apply, so every row probes all six offsets.
+pub fn exposed_faces(coords: &[i32], n: usize, index: &SpatialIndex) -> Vec<u8> {
+    let mut mask = vec![0u8; n];
+    for (row, m) in mask.iter_mut().enumerate() {
+        let b = row * 3;
+        let (x, y, z) = (coords[b], coords[b + 1], coords[b + 2]);
+        for (k, &(dx, dy, dz)) in FACES.iter().enumerate() {
+            // i64 arithmetic + bounds check, as elsewhere: a neighbour that
+            // overflows i32 cannot be a voxel, so its face is exposed.
+            let nx = x as i64 + dx as i64;
+            let ny = y as i64 + dy as i64;
+            let nz = z as i64 + dz as i64;
+            let present = nx >= i32::MIN as i64
+                && nx <= i32::MAX as i64
+                && ny >= i32::MIN as i64
+                && ny <= i32::MAX as i64
+                && nz >= i32::MIN as i64
+                && nz <= i32::MAX as i64
+                && index.get(key_of(nx as i32, ny as i32, nz as i32)).is_some();
+            if !present {
+                *m |= 1 << k;
+            }
+        }
+    }
+    mask
+}
+
 /// Which pairs of *distinct* labels touch: for every adjacent voxel pair
 /// `(u, v)` with `labels[u] != labels[v]`, the pair `(lo, hi)`. Returns
 /// deduplicated, lexicographically sorted pairs.
@@ -205,6 +253,35 @@ mod tests {
             uniform,
             connected_components(&coords, 6, &index, &offs, None)
         );
+    }
+
+    #[test]
+    fn exposed_faces_bit_order_and_interior() {
+        // A single voxel: all six faces exposed.
+        let coords = vec![0, 0, 0];
+        let index = SpatialIndex::build(&coords, 1, IndexKind::Hash).unwrap();
+        assert_eq!(exposed_faces(&coords, 1, &index), vec![0b111111]);
+
+        // A 2x1x1 pair along x: the touching faces clear. Left voxel (row 0)
+        // loses its +x bit (bit 0); right voxel (row 1) loses its -x (bit 1).
+        let coords = vec![0, 0, 0, 1, 0, 0];
+        let index = SpatialIndex::build(&coords, 2, IndexKind::Sorted).unwrap();
+        let mask = exposed_faces(&coords, 2, &index);
+        assert_eq!(mask, vec![0b111111 & !(1 << 0), 0b111111 & !(1 << 1)]);
+
+        // A voxel fully surrounded by its six face-neighbours: mask == 0.
+        let mut coords = vec![0, 0, 0];
+        for &(dx, dy, dz) in FACES.iter() {
+            coords.extend_from_slice(&[dx, dy, dz]);
+        }
+        let index = SpatialIndex::build(&coords, 7, IndexKind::Hash).unwrap();
+        assert_eq!(exposed_faces(&coords, 7, &index)[0], 0);
+    }
+
+    #[test]
+    fn exposed_faces_empty_input() {
+        let index = SpatialIndex::build(&[], 0, IndexKind::Hash).unwrap();
+        assert_eq!(exposed_faces(&[], 0, &index), Vec::<u8>::new());
     }
 
     #[test]

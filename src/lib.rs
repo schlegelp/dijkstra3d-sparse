@@ -343,6 +343,33 @@ fn label_adjacency<'py>(
     Ok(out.into_pyarray(py))
 }
 
+/// Per-voxel 6-bit mask of absent face-neighbours (surface extraction).
+///
+/// Builds the spatial index, probes the six face offsets in one pass, and
+/// frees the index before returning — the memory point of the primitive: no
+/// persistent handle, no six `(N, 3)` neighbour temporaries, one `(N,)`
+/// `uint8` out. Bit order is `+x, -x, +y, -y, +z, -z` (see
+/// `components::exposed_faces`).
+#[pyfunction]
+#[pyo3(signature = (voxels, index_kind))]
+fn exposed_faces<'py>(
+    py: Python<'py>,
+    voxels: PyReadonlyArray2<'py, i32>,
+    index_kind: &str,
+) -> PyResult<Bound<'py, PyArray1<u8>>> {
+    let (coords, n) = coords_slice(&voxels)?;
+    let kind = IndexKind::parse(index_kind).map_err(err)?;
+
+    let mask = py
+        .allow_threads(|| -> Result<Vec<u8>, String> {
+            let sindex = SpatialIndex::build(coords, n, kind)?;
+            Ok(components::exposed_faces(coords, n, &sindex))
+        })
+        .map_err(err)?;
+
+    Ok(mask.into_pyarray(py))
+}
+
 /// `[(lo, hi), ...]` -> flat `[lo, hi, lo, hi, ...]` for the NumPy boundary.
 fn flatten_pairs(pairs: Vec<(i64, i64)>) -> Vec<i64> {
     let mut out = Vec::with_capacity(pairs.len() * 2);
@@ -503,6 +530,15 @@ impl Graph {
         Ok(out.into_pyarray(py))
     }
 
+    /// `exposed_faces` minus `voxels`/`index_kind`. Reuses the handle's
+    /// index, so — unlike the free function — it does *not* free it after
+    /// the pass; the free function is the one that delivers the memory win.
+    fn exposed_faces<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        let mask =
+            py.allow_threads(|| components::exposed_faces(&self.coords, self.n, &self.index));
+        Ok(mask.into_pyarray(py))
+    }
+
     /// `index_of` minus `voxels`/`index_kind`.
     fn index_of<'py>(
         &self,
@@ -520,6 +556,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dijkstra_field, m)?)?;
     m.add_function(wrap_pyfunction!(connected_components, m)?)?;
     m.add_function(wrap_pyfunction!(label_adjacency, m)?)?;
+    m.add_function(wrap_pyfunction!(exposed_faces, m)?)?;
     m.add_function(wrap_pyfunction!(index_of, m)?)?;
     m.add_class::<Graph>()?;
     Ok(())
