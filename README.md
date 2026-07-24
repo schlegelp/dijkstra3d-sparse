@@ -281,9 +281,9 @@ lookups; a `"hash"` one must probe.)
 
 **`factorize(voxels)`** is the sparse `np.unique(coords, axis=0,
 return_inverse=True)`: it assigns every row a dense label, equal exactly when
-the coordinates are equal, in one hash pass instead of a sort. It is the *only*
-primitive here that **accepts duplicate coordinates** — collapsing them is the
-whole point (the others reject repeats).
+the coordinates are equal, in one pass over the rows instead of a sort. It is
+the *only* primitive here that **accepts duplicate coordinates** — collapsing
+them is the whole point (the others reject repeats).
 
 ```python
 n, labels = ds.factorize(cells)                      # (E, 3) with repeats -> labels
@@ -299,6 +299,13 @@ runs on its nodes — the same operation, so it lives here rather than as a
 hand-rolled `argsort` in each caller. It groups by exact coordinate equality,
 which is a different question from `connected_components` (spatial adjacency,
 unique input) despite the shared `(n, labels)` return.
+
+Both of those inputs are *derived from a voxel grid*, so their bounding box is
+compact — and a compact box is resolved through a direct-address table instead
+of a hash map: no hashing, no collisions, and less memory than the map would
+have reserved. Coordinates scattered across a wide box fall back to hashing.
+A cost decision measured from the input's bounding box; the labels are
+identical either way, and `index_kind` is signature parity only.
 
 ### Notes
 

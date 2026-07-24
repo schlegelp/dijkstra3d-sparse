@@ -132,6 +132,73 @@ def test_matches_first_appearance_oracle_on_random_cloud():
     np.testing.assert_array_equal(got_reps, want_reps)
 
 
+def _bbox_cells(v):
+    """Cells in the bounding box, in Python ints (the extents can each span
+    the whole int32 range, so this must not be done in int64)."""
+    v = np.asarray(v, dtype=np.int64)
+    return int(np.prod((v.max(0) - v.min(0) + 1).astype(object)))
+
+
+# `factorize` resolves a coordinate to a label three ways depending on how
+# big the bounding box is: a direct-address table for a compact box, a hash
+# keyed on the box offset for a wide-but-64-bit-addressable one, and a hash
+# keyed on the full spatial key otherwise. Purely a cost decision — the
+# labels are identical — so the cases are paired with the box each provokes.
+IMAX, IMIN = np.iinfo(np.int32).max, np.iinfo(np.int32).min
+
+
+@pytest.mark.parametrize(
+    "name,make",
+    [
+        # box <= 2 cells per row -> direct-address table
+        ("compact", lambda r: r.integers(0, 9, size=(900, 3))),
+        ("compact-negative", lambda r: r.integers(-40, -31, size=(900, 3))),
+        ("compact-flat", lambda r: np.stack([r.integers(0, 30, 900), r.integers(0, 30, 900),
+                                             np.zeros(900, np.int64)], axis=1)),
+        # wide box, still addressable in 64 bits -> box-offset hash
+        ("wide", lambda r: r.integers(0, 2_000_000, size=(900, 3))),
+        ("wide-one-axis", lambda r: np.stack([r.integers(IMIN, IMAX, 900),
+                                              r.integers(0, 3, 900),
+                                              r.integers(0, 3, 900)], axis=1)),
+        # full int32 spread on every axis -> spatial-key hash
+        ("int32-wide", lambda r: r.integers(IMIN, IMAX, size=(900, 3))),
+    ],
+)
+@pytest.mark.parametrize("repeat", [1, 5])
+def test_all_bounding_box_regimes_match_the_oracle(name, make, repeat):
+    rng = np.random.default_rng(abs(hash(name)) % 2**31)
+    v = np.repeat(make(rng).astype(np.int32), repeat, axis=0)
+    rng.shuffle(v)
+    want_n, want_labels, want_reps = reference_factorize(v)
+    got_n, got_labels, got_reps = ds.factorize(v, return_index=True)
+    assert got_n == want_n
+    np.testing.assert_array_equal(got_labels, want_labels)
+    np.testing.assert_array_equal(got_reps, want_reps)
+    np.testing.assert_array_equal(v[got_reps][got_labels], v)
+    # the case is only doing its job if it lands in the intended regime
+    cells, n = _bbox_cells(v), len(v)
+    if name.startswith("compact"):
+        assert cells <= 2 * n
+    elif name.startswith("wide"):
+        assert 2 * n < cells <= 2**64 - 1
+    else:
+        assert cells > 2**64 - 1
+
+
+def test_int32_extremes_do_not_overflow_the_bounding_box():
+    # Extents of 2^32 per axis: measuring the box must not wrap, and the
+    # coordinates must still group by exact equality.
+    v = np.array(
+        [[IMIN, IMIN, IMIN], [IMAX, IMAX, IMAX], [IMIN, IMIN, IMIN], [0, 0, 0], [IMAX, IMIN, 0]],
+        dtype=np.int32,
+    )
+    n, labels, reps = ds.factorize(v, return_index=True)
+    assert n == 4
+    np.testing.assert_array_equal(labels, [0, 1, 0, 2, 3])
+    np.testing.assert_array_equal(reps, [0, 1, 3, 4])
+    np.testing.assert_array_equal(v[reps][labels], v)
+
+
 def test_index_kind_gives_identical_result():
     rng = np.random.default_rng(4)
     distinct = random_cloud(rng, 80, box=5)

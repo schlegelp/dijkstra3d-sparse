@@ -382,9 +382,10 @@ fn exposed_faces<'py>(
 
 /// Dense per-row labels for coordinates by exact equality (duplicates
 /// collapse) — the sparse `np.unique(..., return_inverse=True)`, done as one
-/// hash pass instead of a sort. Returns `(n_labels, labels, reps)`; `reps` is
-/// `None` unless `return_index`. Unlike `Graph`/`index_of`/`connected_components`,
-/// this *accepts* duplicated input — that is its whole reason to exist.
+/// pass over the rows instead of a sort. Returns `(n_labels, labels, reps)`;
+/// `reps` is `None` unless `return_index`. Unlike
+/// `Graph`/`index_of`/`connected_components`, this *accepts* duplicated input
+/// — that is its whole reason to exist.
 #[pyfunction]
 #[pyo3(signature = (voxels, return_index, index_kind))]
 fn factorize<'py>(
@@ -395,7 +396,9 @@ fn factorize<'py>(
 ) -> PyResult<FactorizeArrays<'py>> {
     let (coords, n) = coords_slice(&voxels)?;
     // Validated for signature parity with the other free functions; factorize
-    // is a single hash pass, so the backend does not change its result.
+    // builds no spatial index at all — it picks its own way of resolving a
+    // coordinate to a label from the input's bounding box — so the backend
+    // changes neither its result nor its cost.
     IndexKind::parse(index_kind).map_err(err)?;
 
     let (n_labels, labels, reps) = py.allow_threads(|| dedup::factorize(coords, n, return_index));

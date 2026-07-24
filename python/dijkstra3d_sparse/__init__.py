@@ -846,10 +846,10 @@ def factorize(
     """Dense labels for coordinates by exact equality; duplicates collapse.
 
     The sparse analogue of ``np.unique(coords, axis=0, return_inverse=True)``,
-    computed as a single hash pass rather than a sort. Each row is assigned a
-    label, equal exactly when the coordinates are equal, so an array that is
-    mostly repeats (the four-corners-per-quad a mesher emits, the coarse cell
-    each fine voxel downsamples into) collapses to its distinct set with an
+    computed as a single pass over the rows rather than a sort. Each row is
+    assigned a label, equal exactly when the coordinates are equal, so an array
+    that is mostly repeats (the four-corners-per-quad a mesher emits, the coarse
+    cell each fine voxel downsamples into) collapses to its distinct set with an
     inverse mapping back to every row.
 
     Unlike :class:`Graph`, :func:`index_of` and :func:`connected_components` —
@@ -870,9 +870,9 @@ def factorize(
         of each label, so ``voxels[reps]`` is the deduplicated coordinate set,
         aligned with the labels.
     index_kind
-        Accepted for signature parity with the other free functions. The
-        factorize is always a single hash pass, so this does not change the
-        result (there is no ``Graph`` handle to build here).
+        Accepted for signature parity with the other free functions. No spatial
+        index is built here, so this changes neither the result nor the cost
+        (there is no ``Graph`` handle to build).
 
     Returns
     -------
@@ -891,6 +891,14 @@ def factorize(
     -----
     Exact integer equality only — no tolerance or rounding. ``N == 0`` returns
     ``(0, empty)`` (or ``(0, empty, empty)`` with ``return_index``).
+
+    One cheap pass measures the bounding box first, and coordinates that live
+    in a box of no more than two cells per row — the normal case for anything
+    derived from a voxel grid, which is what this is for — are resolved through
+    a direct-address table rather than a hash map: no hashing, no collisions,
+    and less memory than the map would have reserved. Coordinates scattered
+    across a wide box fall back to hashing. Purely a cost decision; the labels
+    are identical either way.
     """
     vox = _as_voxels(voxels)
     if index_kind not in _INDEX_KINDS:
