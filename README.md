@@ -262,11 +262,20 @@ mask = ds.exposed_faces(voxels)             # (N,) uint8; 0 = interior, 63 = iso
 right = voxels[(mask & (1 << 0)) != 0]      # voxels whose +x face is exposed
 ```
 
-Unlike the other free functions it does not route through a `Graph`: it builds
-the spatial index, runs the probe, and frees the index inside the one call, so
-the surface pass leaves nothing behind for a later stage's peak to stack on.
+Unlike the other free functions it does not route through a `Graph` — and
+builds no spatial index at all. It sorts one packed 16-byte key per voxel and
+sweeps the three positive face offsets across it as three linear merges (a hit
+clears the far voxel's opposite bit, so the other three offsets are free),
+then drops that array inside the one call: 16 B/voxel of working set, and the
+surface pass leaves nothing behind for a later stage's peak to stack on.
+Already-sorted input — what `np.argwhere` and `np.unique(..., axis=0)` hand
+over — makes the sort a single scan. `index_kind` is accepted for signature
+parity only, as with `factorize`.
+
 (`Graph.exposed_faces()` exists too, but reuses — and keeps — the handle's
-index, so it gives up that transient-memory win.)
+index, so it gives up that transient-memory win. It is also the one query
+where the backends diverge: a `"sorted"` handle sweeps its key array with no
+lookups; a `"hash"` one must probe.)
 
 ### Deduplicating coordinates
 

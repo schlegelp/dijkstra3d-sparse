@@ -24,13 +24,18 @@ ALL_SIX = 0b111111  # 63
 
 
 def reference_mask(voxels):
-    """Oracle: bit k set iff voxel + FACE[k] is not itself a voxel."""
+    """Oracle: bit k set iff voxel + FACE[k] is not itself a voxel.
+
+    Steps in unbounded Python ints, never int32: one step off an int32 extreme
+    lands outside the representable range, and so is absent by definition —
+    it must not wrap around to the far end and match a real voxel there.
+    """
     voxels = np.asarray(voxels)
     present = {tuple(int(c) for c in v) for v in voxels}
     mask = np.zeros(len(voxels), dtype=np.uint8)
     for i, v in enumerate(voxels):
         for k, off in enumerate(FACE):
-            if tuple(int(v[a] + off[a]) for a in range(3)) not in present:
+            if tuple(int(v[a]) + int(off[a]) for a in range(3)) not in present:
                 mask[i] |= 1 << k
     return mask
 
@@ -101,6 +106,51 @@ def test_parity_with_index_of_probe_per_bit(kind):
         got = ((mask >> k) & 1).astype(bool)
         want = ds.index_of(vox, vox + FACE[k], strict=False) < 0
         np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_parity_on_a_dense_cloud_across_all_paths(shuffle):
+    # Dense enough that most voxels have several face-neighbours, which is
+    # what exercises the sorted merge sweep's cursor (the tiny shapes above
+    # do not). All four code paths must land on the same mask.
+    rng = np.random.default_rng(21)
+    vox = np.unique(rng.integers(0, 12, size=(2000, 3)).astype(np.int32), axis=0)
+    if shuffle:
+        vox = vox[rng.permutation(len(vox))]
+    want = reference_mask(vox)
+    for got in (
+        ds.exposed_faces(vox, index_kind="hash"),
+        ds.exposed_faces(vox, index_kind="sorted"),
+        ds.Graph(vox, index_kind="hash").exposed_faces(),
+        ds.Graph(vox, index_kind="sorted").exposed_faces(),
+    ):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_int32_extremes_do_not_wrap_between_axes():
+    # A neighbour one step past an axis maximum has no int32 coordinate, so
+    # that face is exposed. The trap: the packed key steps by a constant, so
+    # (x, INT32_MAX, z) + (0, 1, 0) must not be read as (x + 1, INT32_MIN, z).
+    imax, imin = np.iinfo(np.int32).max, np.iinfo(np.int32).min
+    vox = np.array(
+        [
+            [imax, 0, 0], [imax - 1, 0, 0],   # +x extreme, touched from below
+            [imin, 0, 0], [imin + 1, 0, 0],   # -x extreme, touched from above
+            [3, imax, 9], [4, imin, 9],       # the y -> x carry trap
+            [3, 5, imax], [3, 6, imin],       # the z -> y carry trap
+        ],
+        dtype=np.int32,
+    )
+    want = reference_mask(vox)
+    for kind in ("hash", "sorted"):
+        np.testing.assert_array_equal(ds.exposed_faces(vox, index_kind=kind), want)
+        np.testing.assert_array_equal(ds.Graph(vox, index_kind=kind).exposed_faces(), want)
+    # the extremes themselves: +x exposed at INT32_MAX, -x exposed at INT32_MIN
+    assert want[0] & 0b11 == 0b01
+    assert want[2] & 0b11 == 0b10
+    # nothing may have paired the y/z carry rows with each other
+    assert want[4] & (1 << 2) and want[5] & (1 << 3)
+    assert want[6] & (1 << 4) and want[7] & (1 << 5)
 
 
 def test_caller_directional_split_matches_sets():

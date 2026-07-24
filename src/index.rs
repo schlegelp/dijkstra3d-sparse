@@ -107,7 +107,7 @@ impl SpatialIndex {
     }
 }
 
-fn duplicate_msg(coords: &[i32], a: u32, b: u32) -> String {
+pub fn duplicate_msg(coords: &[i32], a: u32, b: u32) -> String {
     let base = a as usize * 3;
     format!(
         "duplicate voxel coordinate ({}, {}, {}) at rows {} and {}",

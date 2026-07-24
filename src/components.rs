@@ -1,7 +1,7 @@
 //! Connected components and label adjacency over the implicit sparse grid.
 //! Both walk the same neighbour probe as Dijkstra — no edge list is built.
 
-use crate::index::{key_of, SpatialIndex};
+use crate::index::{duplicate_msg, key_of, SpatialIndex};
 use rustc_hash::FxHashSet;
 
 struct Dsu {
@@ -130,6 +130,7 @@ pub fn connected_components(
 /// The six face-neighbour offsets, in the bit order `exposed_faces`
 /// reports: `+x, -x, +y, -y, +z, -z`. Bit `k` of a voxel's mask is set
 /// iff the neighbour at `FACES[k]` is absent from the set.
+#[cfg(test)]
 const FACES: [(i32, i32, i32); 6] = [
     (1, 0, 0),  // bit 0: +x
     (-1, 0, 0), // bit 1: -x
@@ -139,40 +140,149 @@ const FACES: [(i32, i32, i32); 6] = [
     (0, 0, -1), // bit 5: -z
 ];
 
-/// Per voxel, a 6-bit mask of which face-neighbours are *absent* from the
-/// set. This is the surface-extraction probe `find_surface_voxels` runs —
-/// the same coordinate walk as `connected_components`, minus the union-find:
-/// one pass, no `(N, 3)` neighbour temporaries, and (in the free-function
-/// binding) the spatial index is built and freed within the call.
+/// Every face exposed: the state a voxel starts in, before the sweeps clear
+/// the faces that turn out to be covered.
+const ALL_FACES: u8 = 0b111_111;
+
+/// Bit position of an axis' 32-bit field inside a `key_of` key: `x` occupies
+/// `[64, 96)`, `y` `[32, 64)`, `z` `[0, 32)`. Stepping one voxel along
+/// `+axis` is exactly `key + (1 << axis_shift(axis))`, which is why the
+/// sweeps never touch coordinates at all.
+const fn axis_shift(axis: u32) -> u32 {
+    64 - 32 * axis
+}
+
+/// Clear both face bits of every voxel pair adjacent along one axis.
 ///
-/// Bit `k` of `mask[row]` is set iff `voxels[row] + FACES[k]` is not in the
-/// set. A fully interior voxel yields `0`; a lone voxel yields `0b111111`
-/// (`63`). Directional by nature — the `half`-offset trick the pair
-/// primitives use does not apply, so every row probes all six offsets.
-pub fn exposed_faces(coords: &[i32], n: usize, index: &SpatialIndex) -> Vec<u8> {
-    let mut mask = vec![0u8; n];
-    for (row, m) in mask.iter_mut().enumerate() {
-        let b = row * 3;
-        let (x, y, z) = (coords[b], coords[b + 1], coords[b + 2]);
-        for (k, &(dx, dy, dz)) in FACES.iter().enumerate() {
-            // i64 arithmetic + bounds check, as elsewhere: a neighbour that
-            // overflows i32 cannot be a voxel, so its face is exposed.
-            let nx = x as i64 + dx as i64;
-            let ny = y as i64 + dy as i64;
-            let nz = z as i64 + dz as i64;
-            let present = nx >= i32::MIN as i64
-                && nx <= i32::MAX as i64
-                && ny >= i32::MIN as i64
-                && ny <= i32::MAX as i64
-                && nz >= i32::MIN as i64
-                && nz <= i32::MAX as i64
-                && index.get(key_of(nx as i32, ny as i32, nz as i32)).is_some();
-            if !present {
-                *m |= 1 << k;
+/// `at(i)` yields the `(key, row)` of the `i`-th voxel *in ascending key
+/// order*. Since `key_of` is order-preserving and the step is a constant
+/// `delta`, the target `key + delta` is strictly increasing in `i`, so the
+/// cursor `j` never rewinds: one merge pass over the sorted keys replaces
+/// `n` binary searches, and every probe is a sequential read.
+///
+/// Each hit clears *both* sides — the `+axis` bit of the near voxel and the
+/// `-axis` bit of the far one — so only the three positive axes are swept.
+fn sweep_axis<const AXIS: u32, F>(n: usize, at: F, mask: &mut [u8])
+where
+    F: Fn(usize) -> (u128, u32),
+{
+    let shift = axis_shift(AXIS);
+    let delta = 1u128 << shift;
+    let (pos, neg) = (1u8 << (2 * AXIS), 1u8 << (2 * AXIS + 1));
+
+    let mut j = 0usize;
+    for i in 0..n {
+        let (key, row) = at(i);
+        // One step past the axis maximum is not an i32 coordinate, so that
+        // face stays exposed. It is also exactly the case where the add
+        // would carry into the next axis' field and name a different voxel.
+        if (key >> shift) as u32 == u32::MAX {
+            continue;
+        }
+        let target = key + delta;
+        while j < n && at(j).0 < target {
+            j += 1;
+        }
+        if j == n {
+            break; // every later target is larger still
+        }
+        let (nkey, nrow) = at(j);
+        if nkey == target {
+            mask[row as usize] &= !pos;
+            mask[nrow as usize] &= !neg;
+        }
+    }
+    // The `-axis` face of a voxel at the axis minimum is likewise never
+    // cleared, because no voxel can sit one step below it.
+}
+
+/// Hash-backend fallback: probe the three *positive* faces per row and
+/// scatter the result to both sides of each hit. Halves the lookups a
+/// six-offset probe would do, at no extra memory — the mask write to the
+/// neighbour's row is one byte into an `N`-byte array.
+fn probe_positive_faces(coords: &[i32], n: usize, index: &SpatialIndex, mask: &mut [u8]) {
+    debug_assert_eq!(coords.len(), 3 * n);
+    for (row, v) in coords.chunks_exact(3).enumerate() {
+        let key = key_of(v[0], v[1], v[2]);
+        for axis in 0..3u32 {
+            let shift = axis_shift(axis);
+            if (key >> shift) as u32 == u32::MAX {
+                continue; // no i32 neighbour past the axis maximum
+            }
+            if let Some(nbr) = index.get(key + (1u128 << shift)) {
+                mask[row] &= !(1u8 << (2 * axis));
+                mask[nbr as usize] &= !(1u8 << (2 * axis + 1));
             }
         }
     }
+}
+
+/// Per voxel, a 6-bit mask of which face-neighbours are *absent* from the
+/// set. This is the surface-extraction probe `find_surface_voxels` runs —
+/// the same coordinate walk as `connected_components`, minus the union-find:
+/// one pass, no `(N, 3)` neighbour temporaries.
+///
+/// Bit `k` of `mask[row]` is set iff `voxels[row] + FACES[k]` is not in the
+/// set. A fully interior voxel yields `0`; a lone voxel yields `0b111111`
+/// (`63`).
+///
+/// The mask is directional, but the *probing* need not be: an adjacency
+/// found from the `+axis` side clears the far voxel's `-axis` bit too, so
+/// three offsets suffice — the `half`-offset trick the pair primitives use,
+/// with a scatter instead of a single visit. A sorted index then goes one
+/// better and skips lookups entirely (see `sweep_axis`); the free function
+/// takes `exposed_faces_unindexed`, which builds neither index.
+pub fn exposed_faces(coords: &[i32], n: usize, index: &SpatialIndex) -> Vec<u8> {
+    let mut mask = vec![ALL_FACES; n];
+    match index {
+        // The sorted backend already holds exactly what the sweep needs.
+        SpatialIndex::Sorted { keys, rows } => {
+            debug_assert_eq!(keys.len(), n);
+            let at = |i: usize| (keys[i], rows[i]);
+            sweep_axis::<0, _>(keys.len(), at, &mut mask);
+            sweep_axis::<1, _>(keys.len(), at, &mut mask);
+            sweep_axis::<2, _>(keys.len(), at, &mut mask);
+        }
+        SpatialIndex::Hash(_) => probe_positive_faces(coords, n, index, &mut mask),
+    }
     mask
+}
+
+/// `exposed_faces` for a caller holding no index — the free-function path.
+///
+/// Builds the least the sweep needs and nothing more: one `u128` per voxel,
+/// the 96-bit key with the row index riding in the 32 bits `key_of` leaves
+/// free at the top. Sorting that array *is* the index — 16 B/voxel, against
+/// the ~2.5x of `SpatialIndex::Sorted` (which allocates a `(key, row)` pair
+/// array on top of its two output vectors) and the ~4x of a hash table that
+/// rounds its bucket count up to a power of two. It is dropped before the
+/// mask is returned, which is the memory point of the primitive.
+///
+/// Duplicate coordinates are rejected with the message `SpatialIndex::build`
+/// produces, since callers rely on it.
+pub fn exposed_faces_unindexed(coords: &[i32], n: usize) -> Result<Vec<u8>, String> {
+    debug_assert_eq!(coords.len(), 3 * n);
+    let mut packed: Vec<u128> = coords
+        .chunks_exact(3)
+        .enumerate()
+        .map(|(row, v)| (key_of(v[0], v[1], v[2]) << 32) | row as u128)
+        .collect();
+    // Sorts by key, then by row; `n <= i32::MAX` keeps the row in 32 bits.
+    // Already-sorted input (what `np.argwhere` and friends hand over) costs
+    // one scan here, not a full sort.
+    packed.sort_unstable();
+    for w in packed.windows(2) {
+        if w[0] >> 32 == w[1] >> 32 {
+            return Err(duplicate_msg(coords, w[0] as u32, w[1] as u32));
+        }
+    }
+
+    let mut mask = vec![ALL_FACES; n];
+    let at = |i: usize| (packed[i] >> 32, packed[i] as u32);
+    sweep_axis::<0, _>(n, at, &mut mask);
+    sweep_axis::<1, _>(n, at, &mut mask);
+    sweep_axis::<2, _>(n, at, &mut mask);
+    Ok(mask)
 }
 
 /// Which pairs of *distinct* labels touch: for every adjacent voxel pair
@@ -282,6 +392,103 @@ mod tests {
     fn exposed_faces_empty_input() {
         let index = SpatialIndex::build(&[], 0, IndexKind::Hash).unwrap();
         assert_eq!(exposed_faces(&[], 0, &index), Vec::<u8>::new());
+        assert_eq!(exposed_faces_unindexed(&[], 0).unwrap(), Vec::<u8>::new());
+    }
+
+    /// Brute-force oracle: bit `k` set iff `voxel + FACES[k]` is absent.
+    fn reference_mask(coords: &[i32], n: usize) -> Vec<u8> {
+        let present: FxHashSet<(i32, i32, i32)> = (0..n)
+            .map(|r| (coords[3 * r], coords[3 * r + 1], coords[3 * r + 2]))
+            .collect();
+        (0..n)
+            .map(|r| {
+                let (x, y, z) = (coords[3 * r], coords[3 * r + 1], coords[3 * r + 2]);
+                let mut m = 0u8;
+                for (k, &(dx, dy, dz)) in FACES.iter().enumerate() {
+                    let nbr = (x.checked_add(dx), y.checked_add(dy), z.checked_add(dz));
+                    let inside = match nbr {
+                        (Some(a), Some(b), Some(c)) => present.contains(&(a, b, c)),
+                        _ => false,
+                    };
+                    if !inside {
+                        m |= 1 << k;
+                    }
+                }
+                m
+            })
+            .collect()
+    }
+
+    /// A shuffled pseudo-random cloud dense enough that most voxels have
+    /// several face-neighbours — the case the sweep's cursor logic has to
+    /// get right, unlike the hand-built shapes above.
+    fn scattered_cloud() -> (Vec<i32>, usize) {
+        let mut seen = FxHashSet::default();
+        let mut coords = Vec::new();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..4000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let p = (
+                (state % 11) as i32 - 5,
+                ((state >> 8) % 11) as i32 - 5,
+                ((state >> 16) % 11) as i32 - 5,
+            );
+            if seen.insert(p) {
+                coords.extend_from_slice(&[p.0, p.1, p.2]);
+            }
+        }
+        let n = coords.len() / 3;
+        (coords, n)
+    }
+
+    #[test]
+    fn exposed_faces_all_three_paths_match_the_oracle() {
+        let (coords, n) = scattered_cloud();
+        let want = reference_mask(&coords, n);
+        for kind in [IndexKind::Sorted, IndexKind::Hash] {
+            let index = SpatialIndex::build(&coords, n, kind).unwrap();
+            assert_eq!(exposed_faces(&coords, n, &index), want, "{kind:?}");
+        }
+        assert_eq!(exposed_faces_unindexed(&coords, n).unwrap(), want);
+    }
+
+    #[test]
+    fn exposed_faces_at_the_i32_extremes() {
+        // A step off an axis extreme has no i32 coordinate, so that face is
+        // exposed. The trap the sweeps have to dodge: the packed key steps by
+        // a constant, so `(x, i32::MAX, z) + (0, 1, 0)` must not carry into
+        // the x field and be read as the real voxel `(x + 1, i32::MIN, z)`.
+        #[rustfmt::skip]
+        let coords: Vec<i32> = vec![
+            i32::MAX, 0, 0,   i32::MAX - 1, 0, 0,  // +x extreme, touched from below
+            i32::MIN, 7, 7,   i32::MIN + 1, 7, 7,  // -x extreme, touched from above
+            3, i32::MAX, 9,   4, i32::MIN, 9,      // the y -> x carry trap
+            3, 5, i32::MAX,   3, 6, i32::MIN,      // the z -> y carry trap
+        ];
+        let n = coords.len() / 3;
+        let want = reference_mask(&coords, n);
+        for kind in [IndexKind::Sorted, IndexKind::Hash] {
+            let index = SpatialIndex::build(&coords, n, kind).unwrap();
+            assert_eq!(exposed_faces(&coords, n, &index), want, "{kind:?}");
+        }
+        assert_eq!(exposed_faces_unindexed(&coords, n).unwrap(), want);
+        // The extremes themselves: +x of the i32::MAX voxel is exposed, its
+        // -x is covered by row 1; mirrored for the i32::MIN voxel.
+        assert_eq!(want[0] & 0b11, 0b01);
+        assert_eq!(want[2] & 0b11, 0b10);
+        // ...and neither carry pair may have been matched to the other.
+        assert_eq!(want[4..], [ALL_FACES; 4]);
+    }
+
+    #[test]
+    fn exposed_faces_unindexed_rejects_duplicates() {
+        let coords: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 1, 2, 3];
+        let err = exposed_faces_unindexed(&coords, 3).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("(1, 2, 3)"), "{err}");
+        assert!(err.contains("rows 0 and 2"), "{err}");
     }
 
     #[test]

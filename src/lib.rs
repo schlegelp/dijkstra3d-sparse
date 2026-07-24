@@ -354,11 +354,11 @@ fn label_adjacency<'py>(
 
 /// Per-voxel 6-bit mask of absent face-neighbours (surface extraction).
 ///
-/// Builds the spatial index, probes the six face offsets in one pass, and
-/// frees the index before returning — the memory point of the primitive: no
-/// persistent handle, no six `(N, 3)` neighbour temporaries, one `(N,)`
-/// `uint8` out. Bit order is `+x, -x, +y, -y, +z, -z` (see
-/// `components::exposed_faces`).
+/// Sorts a packed `(key, row)` array, sweeps the three positive face
+/// offsets across it, and frees it before returning — the memory point of
+/// the primitive: no persistent handle, no six `(N, 3)` neighbour
+/// temporaries, one `(N,)` `uint8` out. Bit order is `+x, -x, +y, -y, +z,
+/// -z` (see `components::exposed_faces_unindexed`).
 #[pyfunction]
 #[pyo3(signature = (voxels, index_kind))]
 fn exposed_faces<'py>(
@@ -367,13 +367,14 @@ fn exposed_faces<'py>(
     index_kind: &str,
 ) -> PyResult<Bound<'py, PyArray1<u8>>> {
     let (coords, n) = coords_slice(&voxels)?;
-    let kind = IndexKind::parse(index_kind).map_err(err)?;
+    // Validated for signature parity with the other free functions; the
+    // surface sweep builds its own sorted key array (cheaper in both time
+    // and memory than either backend), so the choice cannot change what it
+    // returns or what it costs. Same contract as `factorize`.
+    IndexKind::parse(index_kind).map_err(err)?;
 
     let mask = py
-        .allow_threads(|| -> Result<Vec<u8>, String> {
-            let sindex = SpatialIndex::build(coords, n, kind)?;
-            Ok(components::exposed_faces(coords, n, &sindex))
-        })
+        .allow_threads(|| components::exposed_faces_unindexed(coords, n))
         .map_err(err)?;
 
     Ok(mask.into_pyarray(py))

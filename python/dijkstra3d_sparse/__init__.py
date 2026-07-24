@@ -405,6 +405,12 @@ class Graph:
         handle's index, so it does *not* free the index within the call. The
         free function is the one whose whole point is a transient index — use
         it, not a throwaway handle, when the surface pass is all you need.
+
+        This is the one query where the two backends differ markedly. A
+        ``"sorted"`` handle answers it by merging its key array against
+        itself, with no lookups at all; a ``"hash"`` one has to probe, which
+        costs several times more. Neither allocates. If a handle exists mainly
+        to serve surface passes, build it with ``index_kind="sorted"``.
         """
         return self._graph.exposed_faces()
 
@@ -779,12 +785,13 @@ def exposed_faces(
     cheap boolean gathers rather than six coordinate probes.
 
     Unlike the other free functions in this module, this one does **not** route
-    through a :class:`Graph`: it builds the spatial index, runs the single
-    probing pass, and frees the index — all inside the native call, before the
-    output array is even handed back. That transient index is the entire point
-    (:meth:`Graph.exposed_faces` reuses a persistent one and so gives up the
-    memory win); it keeps the surface pass's own footprint from stacking under
-    a later peak.
+    through a :class:`Graph`, and builds no spatial index at all: it sorts one
+    packed 16-byte key per voxel, sweeps the three positive face offsets across
+    it as three linear merges, and frees that array — all inside the native
+    call, before the output array is even handed back. Nothing persists
+    (:meth:`Graph.exposed_faces` reuses a persistent index and so gives up the
+    memory win); the surface pass's own footprint never stacks under a later
+    peak.
 
     Parameters
     ----------
@@ -792,8 +799,10 @@ def exposed_faces(
         ``(N, 3)`` integer voxel coordinates (any integer dtype in int32
         range). Duplicate coordinates are rejected, as by :class:`Graph`.
     index_kind
-        Spatial-index backend, ``"hash"`` (default) or ``"sorted"``; see
-        :func:`dijkstra_field`. Identical results, performance knob only.
+        Accepted for signature parity with the other free functions. The
+        surface sweep builds its own sorted key array — cheaper in both time
+        and memory than either backend — so this changes neither the result
+        nor the cost (there is no :class:`Graph` handle to build here).
 
     Returns
     -------
@@ -813,12 +822,18 @@ def exposed_faces(
     -----
     "Exposed face" is inherently a 6-connectivity notion, so there is no
     ``connectivity`` parameter.
+
+    Only three offsets are ever probed: an adjacency found from the ``+axis``
+    side also clears the far voxel's ``-axis`` bit. Combined with the merge
+    sweep this makes the pass linear in ``N`` after the sort, and the sort
+    itself is a single scan when ``voxels`` already arrives in lexicographic
+    order (what ``np.argwhere`` / ``np.unique(..., axis=0)`` hand over).
     """
     vox = _as_voxels(voxels)
     if index_kind not in _INDEX_KINDS:
         raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
     # Deliberately *not* Graph(...).exposed_faces(): the native free function
-    # frees the index inside the call, which the persistent handle cannot.
+    # drops its key array inside the call, which the persistent handle cannot.
     return _native.exposed_faces(vox, index_kind)
 
 
