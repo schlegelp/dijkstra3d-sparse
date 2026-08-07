@@ -39,7 +39,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 
 _COST_MODES = ("vertex", "additive", "geometric")
 _CONNECTIVITIES = (6, 18, 26)
