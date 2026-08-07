@@ -34,6 +34,7 @@ __all__ = [
     "label_adjacency",
     "exposed_faces",
     "factorize",
+    "ray_exits",
     "index_of",
     "__version__",
 ]
@@ -99,6 +100,55 @@ def _as_int_field(name: str, values: npt.ArrayLike, n: int) -> np.ndarray:
     if arr.shape != (n,):
         raise ValueError(f"{name} must have shape (N,) = ({n},), got {arr.shape}")
     return arr
+
+
+def _as_rays(name: str, values: npt.ArrayLike) -> np.ndarray:
+    """Coerce to a C-contiguous (R, 3) float64 array of finite values."""
+    arr = np.ascontiguousarray(values, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"{name} must have shape (R, 3), got {arr.shape}")
+    # A NaN makes every comparison in the walk false, so the termination test
+    # would never fire; reject here rather than let it reach the loop.
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must be finite (no NaN or inf)")
+    return arr
+
+
+def _ray_args(
+    origins: npt.ArrayLike,
+    directions: npt.ArrayLike,
+    max_dist: npt.ArrayLike,
+    max_crossings: int,
+) -> tuple:
+    """Validate a ray batch — everything except ``voxels``/``index_kind``,
+    which are fixed by the :class:`Graph` handle. Returns the positional
+    argument tuple for the native call."""
+    o = _as_rays("origins", origins)
+    d = _as_rays("directions", directions)
+    r = o.shape[0]
+    if d.shape[0] != r:
+        raise ValueError(
+            f"origins and directions must have the same length, got {r} and {d.shape[0]}"
+        )
+
+    # np.asarray, not ascontiguousarray: the latter promotes a scalar to a
+    # 1-element array, which would hide the scalar case from the broadcast.
+    caps = np.asarray(max_dist, dtype=np.float64)
+    if caps.ndim == 0:
+        caps = np.full(r, caps[()], dtype=np.float64)
+    elif caps.shape != (r,):
+        raise ValueError(
+            f"max_dist must be a scalar or have shape (R,) = ({r},), got {caps.shape}"
+        )
+    else:
+        caps = np.ascontiguousarray(caps)
+    if caps.size and not (np.all(np.isfinite(caps)) and caps.min() >= 0):
+        raise ValueError("max_dist must be finite and >= 0")
+
+    max_crossings = int(max_crossings)
+    if max_crossings < 1:
+        raise ValueError(f"max_crossings must be >= 1, got {max_crossings}")
+    return o, d, caps, max_crossings
 
 
 def _field_args(
@@ -413,6 +463,26 @@ class Graph:
         to serve surface passes, build it with ``index_kind="sorted"``.
         """
         return self._graph.exposed_faces()
+
+    def ray_exits(
+        self,
+        origins: npt.ArrayLike,
+        directions: npt.ArrayLike,
+        *,
+        max_dist: npt.ArrayLike,
+        max_crossings: int = 1,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Where a batch of rays crosses the object's boundary.
+
+        Identical to the free :func:`ray_exits` (see there for the full
+        parameter and return documentation), with ``voxels`` and
+        ``index_kind`` fixed by the handle — **the entry point to prefer for
+        ray casting**, since a caster fires its rays in chunks against one
+        voxel set and this reuses the index across every chunk.
+        """
+        o, d, caps, k = _ray_args(origins, directions, max_dist, max_crossings)
+        t, n_hits = self._graph.ray_exits(o, d, caps, k)
+        return t.reshape(-1, k), n_hits
 
     def index_of(self, coords: npt.ArrayLike, *, strict: bool = True) -> Union[int, np.ndarray]:
         """Row indices of the given coordinates in the handle's voxels.
@@ -907,6 +977,104 @@ def factorize(
     if return_index:
         return n_labels, labels, reps
     return n_labels, labels
+
+
+def ray_exits(
+    voxels: npt.ArrayLike,
+    origins: npt.ArrayLike,
+    directions: npt.ArrayLike,
+    *,
+    max_dist: npt.ArrayLike,
+    max_crossings: int = 1,
+    index_kind: str = "hash",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Where each ray crosses the boundary of the sparse voxel set.
+
+    Voxel centres sit on integer coordinates, so cell ``c`` occupies
+    ``[c - 0.5, c + 0.5)`` on each axis and the object is the union of its
+    occupied cells. Each ray ``p(t) = origins[r] + t * directions[r]``
+    (``t >= 0``) is walked with a 3-D DDA (Amanatides & Woo) that visits
+    *exactly* the cells it passes through — no sampling, no interpolation —
+    and every ``t`` at which occupancy flips is reported.
+
+    The first such ``t`` is the ray's exit from the object: the cross-section
+    radius along that direction, which is what a tube/profile fit wants. Later
+    ones alternate re-entry, exit, re-entry — a re-entry means the object is
+    not star-shaped about the origin along this ray.
+
+    Parameters
+    ----------
+    voxels
+        ``(N, 3)`` integer voxel coordinates (any integer dtype in int32
+        range). Duplicate coordinates are rejected, as by :class:`Graph`.
+    origins
+        ``(R, 3)`` float ray origins in *index space* (the same coordinate
+        system as ``voxels``, but continuous).
+    directions
+        ``(R, 3)`` float ray directions in index space. They need **not** be
+        normalised, deliberately: pass a physically-unit direction divided by
+        the voxel spacing and ``t`` comes back as a physical distance, with no
+        rescaling and no ``anisotropy`` parameter here — spacing is the
+        caller's metric, not the library's. A zero component simply never
+        crosses that axis; an all-zero direction reports nothing.
+    max_dist
+        Scalar or ``(R,)`` cap on ``t`` — **not** on the number of cells. A
+        ray that reaches it without crossing gets ``n_hits = 0`` ("escaped").
+        Per-ray caps are the point: a caster scaling the cap by each origin's
+        own expected radius would otherwise have to either clip the fat parts
+        of the object or let the thin ones run for thousands of cells. Must be
+        finite and non-negative.
+    max_crossings
+        How many crossings to report per ray (default 1 — just the exit).
+        Walking stops at ``max_crossings`` or at ``max_dist``, whichever comes
+        first, so this is a cost knob as well as an output shape.
+    index_kind
+        Spatial-index backend; see :func:`dijkstra_field`. Unlike
+        :func:`exposed_faces` and :func:`factorize`, where it is inert, it
+        genuinely matters here: a ray walk is a stream of unpredictable point
+        probes with no exploitable ordering, which is exactly the case
+        ``"hash"`` (the default) exists for. ``"sorted"`` returns *identical*
+        results but is measurably slower.
+
+    Returns
+    -------
+    t : ``(R, max_crossings)`` float64
+        Crossing distances in increasing order, ``+inf`` beyond ``n_hits[r]``.
+        ``t[r, 0]`` is the first exit, ``t[r, 1]`` the first re-entry after
+        it, ``t[r, 2]`` the next exit, and so on — strictly alternating.
+    n_hits : ``(R,)`` int32
+        How many entries of ``t[r]`` are valid.
+
+    Notes
+    -----
+    **The origin cell is assumed occupied and is never itself reported.** If
+    it is empty the ray has nothing to exit, so ``n_hits[r] = 0`` — the same
+    answer as "escaped". Callers that need to tell those apart already know:
+    one :func:`index_of` probe per origin settles it, and it is normally one
+    probe per *seed*, not per ray.
+
+    A ray that walks off the end of the int32 coordinate range stops there. No
+    voxel can live outside that range, so the step out of it is a real exit
+    and is reported; nothing beyond it is.
+
+    ``origins`` and ``directions`` must be finite: a ``NaN`` would make every
+    comparison in the walk false, and the termination test would never fire.
+
+    See Also
+    --------
+    Graph.ray_exits : the same query with the index built once — **prefer it**
+        for anything beyond a single call, since a caster fires its rays in
+        chunks against one voxel set and this function rebuilds the index for
+        each chunk.
+    """
+    vox = _as_voxels(voxels)
+    if index_kind not in _INDEX_KINDS:
+        raise ValueError(f"index_kind must be one of {_INDEX_KINDS}, got {index_kind!r}")
+    o, d, caps, k = _ray_args(origins, directions, max_dist, max_crossings)
+    # Deliberately *not* Graph(...).ray_exits(): the handle keeps its own copy
+    # of the coordinates, which a one-shot call has no use for.
+    t, n_hits = _native.ray_exits(vox, o, d, caps, k, index_kind)
+    return t.reshape(-1, k), n_hits
 
 
 def index_of(

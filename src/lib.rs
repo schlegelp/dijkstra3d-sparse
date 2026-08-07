@@ -14,6 +14,7 @@ mod dedup;
 mod dijkstra;
 mod index;
 mod offsets;
+mod raycast;
 
 use numpy::{
     Element, IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
@@ -47,20 +48,80 @@ type FactorizeArrays<'py> = (
     Option<Bound<'py, PyArray1<i64>>>,
 );
 
+/// `(t, n_hits)` output of `ray_exits`; `t` is flat `(R * max_crossings)`,
+/// reshaped by the Python wrapper.
+type RayExitArrays<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<i32>>);
+
+/// Extract `(slice, rows)` from a `(rows, 3)` C-contiguous array. `rows_name`
+/// is the symbol the error message uses for the row count ("N" for a voxel
+/// set, "R" for a ray batch).
+fn rows3_slice<'a, T: Element>(
+    name: &str,
+    rows_name: &str,
+    a: &'a PyReadonlyArray2<'a, T>,
+) -> PyResult<(&'a [T], usize)> {
+    let shape = a.shape();
+    if shape.len() != 2 || shape[1] != 3 {
+        return Err(err(format!(
+            "{name} must have shape ({rows_name}, 3), got {shape:?}"
+        )));
+    }
+    let slice = a
+        .as_slice()
+        .map_err(|_| err(format!("{name} must be C-contiguous")))?;
+    Ok((slice, shape[0]))
+}
+
 /// Extract `(coords_slice, n)` from an `(N, 3)` C-contiguous array.
 fn coords_slice<'a>(voxels: &'a PyReadonlyArray2<'a, i32>) -> PyResult<(&'a [i32], usize)> {
-    let shape = voxels.shape();
-    if shape.len() != 2 || shape[1] != 3 {
-        return Err(err(format!("voxels must have shape (N, 3), got {shape:?}")));
-    }
-    let n = shape[0];
+    let (slice, n) = rows3_slice("voxels", "N", voxels)?;
     if n > i32::MAX as usize {
         return Err(err(format!("at most 2^31 - 1 voxels supported, got {n}")));
     }
-    let slice = voxels
-        .as_slice()
-        .map_err(|_| err("voxels must be C-contiguous".into()))?;
     Ok((slice, n))
+}
+
+/// Validate the ray batch shared by the free `ray_exits` and
+/// `Graph::ray_exits`. Friendly checks (finiteness, negative caps) live in
+/// the Python wrapper; these are the ones the walk's memory safety rests on.
+fn validate_rays<'a>(
+    origins: &'a PyReadonlyArray2<'a, f64>,
+    directions: &'a PyReadonlyArray2<'a, f64>,
+    max_dist: &'a PyReadonlyArray1<'a, f64>,
+    max_crossings: usize,
+) -> PyResult<raycast::Rays<'a>> {
+    let (origins, r) = rows3_slice("origins", "R", origins)?;
+    let (directions, dr) = rows3_slice("directions", "R", directions)?;
+    if dr != r {
+        return Err(err(format!(
+            "origins and directions must have the same length, got {r} and {dr}"
+        )));
+    }
+    let max_dist = max_dist
+        .as_slice()
+        .map_err(|_| err("max_dist must be C-contiguous".into()))?;
+    if max_dist.len() != r {
+        return Err(err(format!(
+            "max_dist must have length R = {r} (one entry per ray), got {}",
+            max_dist.len()
+        )));
+    }
+    if max_crossings == 0 {
+        return Err(err("max_crossings must be >= 1, got 0".into()));
+    }
+    // The output is `r * max_crossings` doubles; refuse to allocate a length
+    // that does not fit rather than wrapping into a short buffer.
+    if r.checked_mul(max_crossings).is_none() {
+        return Err(err(format!(
+            "output of {r} rays x {max_crossings} crossings does not fit in memory"
+        )));
+    }
+    Ok(raycast::Rays {
+        origins,
+        directions,
+        max_dist,
+        max_crossings,
+    })
 }
 
 fn check_sources(sources: &[i64], n: usize) -> PyResult<()> {
@@ -410,6 +471,38 @@ fn factorize<'py>(
     ))
 }
 
+/// Boundary crossings of a batch of rays over the sparse voxel set.
+///
+/// One Amanatides-Woo walk per ray against the spatial index — no heap, no
+/// adjacency, no `(R, 3)` lockstep state. Returns `(t, n_hits)`: `t` flat of
+/// length `R * max_crossings` (`+inf` padded, reshaped in Python) and one
+/// crossing count per ray.
+#[pyfunction]
+#[pyo3(signature = (voxels, origins, directions, max_dist, max_crossings, index_kind))]
+fn ray_exits<'py>(
+    py: Python<'py>,
+    voxels: PyReadonlyArray2<'py, i32>,
+    origins: PyReadonlyArray2<'py, f64>,
+    directions: PyReadonlyArray2<'py, f64>,
+    max_dist: PyReadonlyArray1<'py, f64>,
+    max_crossings: usize,
+    index_kind: &str,
+) -> PyResult<RayExitArrays<'py>> {
+    let (coords, n) = coords_slice(&voxels)?;
+    let kind = IndexKind::parse(index_kind).map_err(err)?;
+    // Bound outside the closure: the borrows have to outlive `allow_threads`.
+    let rays = validate_rays(&origins, &directions, &max_dist, max_crossings)?;
+
+    let (t, n_hits) = py
+        .allow_threads(|| -> Result<(Vec<f64>, Vec<i32>), String> {
+            let sindex = SpatialIndex::build(coords, n, kind)?;
+            Ok(raycast::ray_exits(&sindex, &rays))
+        })
+        .map_err(err)?;
+
+    Ok((t.into_pyarray(py), n_hits.into_pyarray(py)))
+}
+
 /// `[(lo, hi), ...]` -> flat `[lo, hi, lo, hi, ...]` for the NumPy boundary.
 fn flatten_pairs(pairs: Vec<(i64, i64)>) -> Vec<i64> {
     let mut out = Vec::with_capacity(pairs.len() * 2);
@@ -579,6 +672,23 @@ impl Graph {
         Ok(mask.into_pyarray(py))
     }
 
+    /// `ray_exits` minus `voxels`/`index_kind` — the primary entry point for
+    /// this primitive: a caster fires its rays in chunks against one voxel
+    /// set, and rebuilding the index per chunk would dominate the walk.
+    #[pyo3(signature = (origins, directions, max_dist, max_crossings))]
+    fn ray_exits<'py>(
+        &self,
+        py: Python<'py>,
+        origins: PyReadonlyArray2<'py, f64>,
+        directions: PyReadonlyArray2<'py, f64>,
+        max_dist: PyReadonlyArray1<'py, f64>,
+        max_crossings: usize,
+    ) -> PyResult<RayExitArrays<'py>> {
+        let rays = validate_rays(&origins, &directions, &max_dist, max_crossings)?;
+        let (t, n_hits) = py.allow_threads(|| raycast::ray_exits(&self.index, &rays));
+        Ok((t.into_pyarray(py), n_hits.into_pyarray(py)))
+    }
+
     /// `index_of` minus `voxels`/`index_kind`.
     fn index_of<'py>(
         &self,
@@ -598,6 +708,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(label_adjacency, m)?)?;
     m.add_function(wrap_pyfunction!(exposed_faces, m)?)?;
     m.add_function(wrap_pyfunction!(factorize, m)?)?;
+    m.add_function(wrap_pyfunction!(ray_exits, m)?)?;
     m.add_function(wrap_pyfunction!(index_of, m)?)?;
     m.add_class::<Graph>()?;
     Ok(())

@@ -109,6 +109,9 @@ exposed_faces(voxels, *, index_kind="hash") -> (N,) uint8   # surface-face mask
 factorize(voxels, *, return_index=False,                    # dedup coords -> labels
           index_kind="hash") -> (n_labels, labels[, reps])
 
+ray_exits(voxels, origins, directions, *, max_dist,         # boundary crossings
+          max_crossings=1, index_kind="hash") -> (t, n_hits)
+
 index_of(voxels, coords, *, strict=True) -> int | (M,) int64
 
 Graph(voxels, *, index_kind="hash")   # reusable handle, methods below
@@ -132,6 +135,7 @@ n_comp, labels = g.connected_components()
 n_rings, rings = g.connected_components(group=level)        # components per group
 ring_edges = g.label_adjacency(rings)                       # which rings touch
 face_mask = g.exposed_faces()                               # surface-face mask
+t, n_hits = g.ray_exits(origins, dirs, max_dist=caps)       # ray boundary crossings
 rows = g.index_of(coords)
 g.n, g.voxels, g.index_kind                                 # introspection
 ```
@@ -306,6 +310,51 @@ of a hash map: no hashing, no collisions, and less memory than the map would
 have reserved. Coordinates scattered across a wide box fall back to hashing.
 A cost decision measured from the input's bounding box; the labels are
 identical either way, and `index_kind` is signature parity only.
+
+### Ray exits
+
+**`ray_exits(voxels, origins, directions, max_dist=…)`** walks each ray through
+the voxel set and reports where it crosses the object's boundary. Voxel centres
+sit on integer coordinates, so cell `c` occupies `[c - 0.5, c + 0.5)`; each ray
+`p(t) = origin + t · direction` (`t ≥ 0`) is stepped with a 3-D DDA
+(Amanatides & Woo) that visits **exactly** the cells it passes through — no
+sampling, no interpolation — and every `t` at which occupancy flips is
+reported:
+
+```python
+g = ds.Graph(voxels)                        # build the index once...
+t, n_hits = g.ray_exits(origins, dirs,      # ...then cast in chunks
+                        max_dist=caps, max_crossings=2)
+
+radius    = np.where(n_hits > 0, t[:, 0], caps)   # first exit = the radius
+escaped   = n_hits == 0                           # never left within max_dist
+reentered = n_hits > 1                            # not star-shaped this way
+```
+
+`t[r, 0]` is the first exit — the cross-section radius along that direction —
+and later entries strictly alternate re-entry / exit, so `n_hits > 1` says the
+object is not star-shaped about the origin along that ray. Padding beyond
+`n_hits[r]` is `+inf`.
+
+- **`directions` are index-space and need not be unit.** Pass a physically-unit
+  direction divided by the voxel spacing and `t` comes back as a *physical*
+  distance — which is why there is no `anisotropy` parameter here: spacing is
+  the caller's metric, not the library's.
+- **`max_dist` bounds `t`, not the cell count**, and is per-ray (scalar or
+  `(R,)`). A ray reaching it without crossing gets `n_hits = 0` — it escaped.
+- **The origin cell is assumed occupied** and never itself reported; a ray
+  starting in an empty cell has nothing to exit and returns `n_hits = 0`.
+- Unlike `exposed_faces`/`factorize`, `index_kind` is **not** inert here: a ray
+  walk is a stream of unpredictable point probes with no exploitable ordering,
+  which is what `"hash"` (the default) is for. `"sorted"` returns identical
+  results, more slowly.
+
+Prefer **`Graph.ray_exits`** over the free function: rays are normally fired in
+chunks against one voxel set, and rebuilding the index per chunk would dominate
+the walk. The per-ray state is 13 scalars in registers and nothing is allocated
+in the loop — the point being that a vectorized DDA must instead keep the live
+ray set in `(R, 3)` arrays and touch all of it to advance any single ray by one
+cell, which costs an order of magnitude more than the index probes it wraps.
 
 ### Notes
 
