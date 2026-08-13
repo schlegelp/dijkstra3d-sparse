@@ -1,9 +1,9 @@
 # dijkstra3d-sparse
 
 Dijkstra shortest paths, distance fields and connected components over
-**sparse** 3D voxel sets given as an `(N, 3)` integer coordinate array — a
-sparse analogue of [seung-lab/dijkstra3d](https://github.com/seung-lab/dijkstra3d),
-which operates on *dense* 3D arrays. Rust core, Python/NumPy frontend.
+**sparse** 3D voxel sets given as an `(N, 3)` integer coordinate array. Rust core, Python/NumPy frontend. `dijkstra3d-sparse` is the sparse analogue of [seung-lab/dijkstra3d](https://github.com/seung-lab/dijkstra3d)
+and [n-shamsi/dijkstra3d-rs](https://github.com/n-shamsi/dijkstra3d-rs)
+which operate on *dense* 3D arrays.
 
 ## Why
 
