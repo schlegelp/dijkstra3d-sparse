@@ -190,8 +190,8 @@ mod tests {
         let mut pred = vec![0i64; 5];
         let hit = dijkstra(&p, &[0], None, 1, &mut dist, &mut pred);
         assert_eq!(hit, -1);
-        for i in 0..5 {
-            assert!((dist[i] - i as f64).abs() < 1e-12);
+        for (i, &distance) in dist.iter().enumerate() {
+            assert!((distance - i as f64).abs() < 1e-12);
         }
         assert_eq!(pred, vec![-1, 0, 1, 2, 3]);
 
