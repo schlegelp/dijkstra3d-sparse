@@ -77,6 +77,52 @@ jobs:
           name: wheels-${{ matrix.platform.name }}
           path: dist
 
+  wasm:
+    name: wasm wheel (pyodide ${{ env.PYODIDE_VERSION }})
+    runs-on: ubuntu-latest
+    env:
+      PYODIDE_VERSION: "314.0.5"
+    steps:
+      - uses: actions/checkout@v4
+      # Pyodide 314.x is CPython 3.14; pyodide-build must run on a matching host.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install pyodide-build "maturin>=1.16"
+
+      # The pinned cross-build environment is the single source of truth for
+      # every toolchain version used below (and by scripts/build-wasm.sh).
+      - name: Read Pyodide toolchain config
+        id: pyodide
+        run: |
+          pyodide xbuildenv install "$PYODIDE_VERSION"
+          echo "emscripten_version=$(pyodide config get emscripten_version)" >> "$GITHUB_OUTPUT"
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ steps.pyodide.outputs.emscripten_version }}
+          # Caching an emsdk used for published wheels risks a stale toolchain.
+          no-cache: true
+
+      - name: Build the wasm wheel
+        run: ./scripts/build-wasm.sh
+
+      # Proves the wheel actually loads and runs under the target Pyodide,
+      # which a tag check alone would not.
+      - name: Run the test suite inside Pyodide
+        run: |
+          pyodide venv .venv-pyodide
+          .venv-pyodide/bin/pip install --upgrade "pip>=26.1.1"
+          .venv-pyodide/bin/pip install numpy scipy pytest
+          .venv-pyodide/bin/pip install dijkstra3d-sparse \
+            --no-index --no-deps --find-links dist
+          .venv-pyodide/bin/python -m pytest tests -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-wasm
+          path: dist
+
   sdist:
     name: sdist
     runs-on: ubuntu-latest
@@ -94,7 +140,7 @@ jobs:
   publish:
     name: publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [rust, test, wheels, sdist]
+    needs: [rust, test, wheels, wasm, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

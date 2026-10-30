@@ -51,6 +51,22 @@ pip install dijkstra3d-sparse
 Pre-built wheels cover Linux / macOS / Windows, Python 3.9+. Building from
 source needs a Rust toolchain (`pip` invokes it automatically via maturin).
 
+### Browser / Pyodide
+
+A WebAssembly wheel is published for **Pyodide 314.x** (CPython 3.14, PEP 783
+platform `pyemscripten_2026_0_wasm32`), so the Rust core runs in the browser
+unchanged:
+
+```python
+import micropip
+await micropip.install("dijkstra3d-sparse")
+```
+
+The full test suite passes under Pyodide. The module is single-threaded and
+pure computation — no threads, filesystem or sockets — so nothing is stubbed
+out or degraded relative to the native wheels. See
+[Building the wasm wheel](#building-the-wasm-wheel) to build one yourself.
+
 ## Quickstart
 
 ```python
@@ -379,6 +395,44 @@ pytest                           # Python test suite (SciPy parity + properties)
 cargo test                       # Rust unit tests
 python benchmarks/bench.py      # benchmark + O(N) memory gate
 ```
+
+### Building the wasm wheel
+
+`scripts/build-wasm.sh` builds the Pyodide wheel. It reads every toolchain
+version from the pinned Pyodide cross-build environment (`PYODIDE_VERSION`,
+default `314.0.5`) rather than hardcoding them, and refuses to build against a
+mismatched Emscripten:
+
+```bash
+# pyodide-build must run on CPython 3.14 -- it defines the target ABI
+uv venv --python 3.14 .venv-wasm && source .venv-wasm/bin/activate
+uv pip install pyodide-build "maturin>=1.16"
+
+# Emscripten, at exactly the version the pinned Pyodide expects (5.0.3 here)
+git clone https://github.com/emscripten-core/emsdk && cd emsdk
+./emsdk install "$(pyodide config get emscripten_version)"
+./emsdk activate "$(pyodide config get emscripten_version)"
+source ./emsdk_env.sh && cd ..
+
+./scripts/build-wasm.sh   # -> dist/*-cp39-abi3-pyemscripten_2026_0_wasm32.whl
+```
+
+The script installs the matching Rust toolchain via `rustup` itself. To run the
+tests against the result:
+
+```bash
+pyodide venv .venv-pyodide
+.venv-pyodide/bin/pip install --upgrade "pip>=26.1.1"
+.venv-pyodide/bin/pip install numpy scipy pytest
+.venv-pyodide/bin/pip install dijkstra3d-sparse --no-index --no-deps --find-links dist
+.venv-pyodide/bin/python -m pytest tests
+```
+
+Two things are easy to get wrong here. The wheel is `abi3`, but maturin still
+needs `--interpreter` pointed at a 3.14 interpreter: given an older one it
+takes a legacy Emscripten code path that requires a nightly compiler. And the
+Emscripten version must match the target Pyodide exactly — a wheel built
+against a different one links but fails to load.
 
 The test suite asserts parity with `scipy.sparse.csgraph` on the equivalent
 explicit CSR graph for all cost modes, connectivities and anisotropies, plus

@@ -341,7 +341,7 @@ fn dijkstra_field<'py>(
     )?;
 
     let (dist, pred, hits) = py
-        .allow_threads(|| -> Result<FieldVecs, String> {
+        .detach(|| -> Result<FieldVecs, String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             Ok(run_field(coords, n, &sindex, &call))
         })
@@ -372,7 +372,7 @@ fn connected_components<'py>(
     let group = per_voxel_slice("group", group.as_ref(), n)?;
 
     let (n_components, labels) = py
-        .allow_threads(|| -> Result<(usize, Vec<i32>), String> {
+        .detach(|| -> Result<(usize, Vec<i32>), String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             let offsets = build_offsets(connectivity, [1.0; 3]);
             Ok(components::connected_components(
@@ -401,7 +401,7 @@ fn label_adjacency<'py>(
     let labels = per_voxel_slice("labels", Some(&labels), n)?.unwrap();
 
     let out = py
-        .allow_threads(|| -> Result<Vec<i64>, String> {
+        .detach(|| -> Result<Vec<i64>, String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             let offsets = build_offsets(connectivity, [1.0; 3]);
             Ok(flatten_pairs(components::label_adjacency(
@@ -435,7 +435,7 @@ fn exposed_faces<'py>(
     IndexKind::parse(index_kind).map_err(err)?;
 
     let mask = py
-        .allow_threads(|| components::exposed_faces_unindexed(coords, n))
+        .detach(|| components::exposed_faces_unindexed(coords, n))
         .map_err(err)?;
 
     Ok(mask.into_pyarray(py))
@@ -462,7 +462,7 @@ fn factorize<'py>(
     // changes neither its result nor its cost.
     IndexKind::parse(index_kind).map_err(err)?;
 
-    let (n_labels, labels, reps) = py.allow_threads(|| dedup::factorize(coords, n, return_index));
+    let (n_labels, labels, reps) = py.detach(|| dedup::factorize(coords, n, return_index));
 
     Ok((
         n_labels,
@@ -494,7 +494,7 @@ fn ray_exits<'py>(
     let rays = validate_rays(&origins, &directions, &max_dist, max_crossings)?;
 
     let (t, n_hits) = py
-        .allow_threads(|| -> Result<(Vec<f64>, Vec<i32>), String> {
+        .detach(|| -> Result<(Vec<f64>, Vec<i32>), String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             Ok(raycast::ray_exits(&sindex, &rays))
         })
@@ -527,7 +527,7 @@ fn index_of<'py>(
     let kind = IndexKind::parse(index_kind).map_err(err)?;
 
     let out = py
-        .allow_threads(|| -> Result<Vec<i64>, String> {
+        .detach(|| -> Result<Vec<i64>, String> {
             let sindex = SpatialIndex::build(coords, n, kind)?;
             Ok(probe_rows(&sindex, qcoords, qn))
         })
@@ -562,7 +562,7 @@ impl Graph {
         let coords = coords.to_vec();
         // Duplicate-coordinate rejection happens here, once per handle.
         let index = py
-            .allow_threads(|| SpatialIndex::build(&coords, n, kind))
+            .detach(|| SpatialIndex::build(&coords, n, kind))
             .map_err(err)?;
         Ok(Graph {
             coords,
@@ -615,8 +615,7 @@ impl Graph {
             stop_mask.as_ref(),
             stop_count,
         )?;
-        let (dist, pred, hits) =
-            py.allow_threads(|| run_field(&self.coords, self.n, &self.index, &call));
+        let (dist, pred, hits) = py.detach(|| run_field(&self.coords, self.n, &self.index, &call));
         Ok((
             dist.into_pyarray(py),
             pred.into_pyarray(py),
@@ -634,7 +633,7 @@ impl Graph {
     ) -> PyResult<(usize, Bound<'py, PyArray1<i32>>)> {
         check_connectivity(connectivity)?;
         let group = per_voxel_slice("group", group.as_ref(), self.n)?;
-        let (n_components, labels) = py.allow_threads(|| {
+        let (n_components, labels) = py.detach(|| {
             let offsets = build_offsets(connectivity, [1.0; 3]);
             components::connected_components(&self.coords, self.n, &self.index, &offsets, group)
         });
@@ -650,7 +649,7 @@ impl Graph {
     ) -> PyResult<Bound<'py, PyArray1<i64>>> {
         check_connectivity(connectivity)?;
         let labels = per_voxel_slice("labels", Some(&labels), self.n)?.unwrap();
-        let out = py.allow_threads(|| {
+        let out = py.detach(|| {
             let offsets = build_offsets(connectivity, [1.0; 3]);
             flatten_pairs(components::label_adjacency(
                 &self.coords,
@@ -667,8 +666,7 @@ impl Graph {
     /// index, so — unlike the free function — it does *not* free it after
     /// the pass; the free function is the one that delivers the memory win.
     fn exposed_faces<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
-        let mask =
-            py.allow_threads(|| components::exposed_faces(&self.coords, self.n, &self.index));
+        let mask = py.detach(|| components::exposed_faces(&self.coords, self.n, &self.index));
         Ok(mask.into_pyarray(py))
     }
 
@@ -685,7 +683,7 @@ impl Graph {
         max_crossings: usize,
     ) -> PyResult<RayExitArrays<'py>> {
         let rays = validate_rays(&origins, &directions, &max_dist, max_crossings)?;
-        let (t, n_hits) = py.allow_threads(|| raycast::ray_exits(&self.index, &rays));
+        let (t, n_hits) = py.detach(|| raycast::ray_exits(&self.index, &rays));
         Ok((t.into_pyarray(py), n_hits.into_pyarray(py)))
     }
 
@@ -696,7 +694,7 @@ impl Graph {
         queries: PyReadonlyArray2<'py, i32>,
     ) -> PyResult<Bound<'py, PyArray1<i64>>> {
         let (qcoords, qn) = coords_slice(&queries)?;
-        let out = py.allow_threads(|| probe_rows(&self.index, qcoords, qn));
+        let out = py.detach(|| probe_rows(&self.index, qcoords, qn));
         Ok(out.into_pyarray(py))
     }
 }
