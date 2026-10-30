@@ -78,7 +78,7 @@ jobs:
           path: dist
 
   wasm:
-    name: wasm wheel (pyodide ${{ env.PYODIDE_VERSION }})
+    name: wasm wheel (pyodide)
     runs-on: ubuntu-latest
     env:
       PYODIDE_VERSION: "314.0.5"
